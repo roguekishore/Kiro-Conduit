@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Credentials and account state — NEVER commit.
+# Paths are configurable (KIRO_CREDS_FILE, ACCOUNTS_CONFIG_FILE,
+# ACCOUNTS_STATE_FILE in conduit/config.py); these are the defaults.
+kiro-creds*.json
+accounts.json
+accounts_state.json
+*.credentials.json
+
+# Local state / debug output (KIRO_CLI_DB_FILE, DEBUG_DIR)
+*.db
+*.sqlite
+*.sqlite3
+debug/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
