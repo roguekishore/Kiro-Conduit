@@ -12,7 +12,16 @@ venv/
 
 # Credentials and account state — NEVER commit.
 # Paths are configurable (KIRO_CREDS_FILE, ACCOUNTS_CONFIG_FILE,
-# ACCOUNTS_STATE_FILE in conduit/config.py); these are the defaults.
+# ACCOUNTS_STATE_FILE in conduit/config.py).
+#
+# credentials.json and state.json are the ACTUAL config.py defaults for
+# ACCOUNTS_CONFIG_FILE / ACCOUNTS_STATE_FILE, and were missing here: an earlier
+# version of this comment claimed the patterns below were "the defaults" while
+# listing neither. They are the files an operator really creates — the app's
+# startup handler loads exactly those names — so `git add .` would have staged
+# live cloud credentials. Keep this list in sync with config.py.
+credentials.json
+state.json
 kiro-creds*.json
 accounts.json
 accounts_state.json
