@@ -195,6 +195,9 @@ KIRO_CODEWHISPERER_HOST_TEMPLATE: str = "https://codewhisperer.{region}.amazonaw
 # x-amz-target for the ListAvailableProfiles operation
 PROFILE_DISCOVERY_AMZ_TARGET: str = "AmazonCodeWhispererService.ListAvailableProfiles"
 
+# x-amz-target for the GetUsageLimits operation (Lane E)
+USAGE_LIMITS_AMZ_TARGET: str = "AmazonCodeWhispererService.GetUsageLimits"
+
 # Cooldown before retrying a failed profileArn discovery (seconds).
 # Prevents adding a failing round-trip to every single request.
 PROFILE_DISCOVERY_RETRY_INTERVAL: int = int(os.getenv("PROFILE_DISCOVERY_RETRY_INTERVAL", "300"))
@@ -571,6 +574,35 @@ ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
 
 # Interval for periodic state.json saving in seconds
 STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", "10"))
+
+# ==================================================================================================
+# Application Version
+# ==================================================================================================
+
+# ==================================================================================================
+# Kiro Native System Prompt (Lane B)
+# ==================================================================================================
+
+# Send system prompt to conversationState.systemPrompt (native Kiro field) rather than
+# prepending it into the first user message.
+# Default: True (on).  Set KIRO_NATIVE_SYSTEM_PROMPT=false to fall back to prepend mode.
+KIRO_NATIVE_SYSTEM_PROMPT: bool = os.getenv("KIRO_NATIVE_SYSTEM_PROMPT", "true").lower() == "true"
+
+# ==================================================================================================
+# SAGA Seam Emit Settings (Lane F — CONTRACT-conduit-saga-seam.md v1)
+# ==================================================================================================
+
+# SAGA ingest endpoint. Loopback only. WS-C owns the port; 9400 is the agreed default.
+SAGA_INGEST_URL: str = os.getenv("SAGA_INGEST_URL", "http://127.0.0.1:9400/ingest/conduit")
+
+# Master switch. Default False — off until the maintainer wires SAGA (WS-C).
+# Set SAGA_EMIT_ENABLED=true in .env once SAGA is running and the seam is verified.
+SAGA_EMIT_ENABLED: bool = os.getenv("SAGA_EMIT_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# Bounded emit queue size. When the queue is full, the oldest entry is evicted
+# (drop-oldest) rather than blocking the caller. Guards against a wedged SAGA
+# growing memory without limit.
+SAGA_EMIT_QUEUE_SIZE: int = int(os.getenv("SAGA_EMIT_QUEUE_SIZE", "256"))
 
 # ==================================================================================================
 # Application Version
