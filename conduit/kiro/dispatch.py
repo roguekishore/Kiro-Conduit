@@ -13,11 +13,12 @@ that resolved to only 4 of the 17+ known event names).
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, AsyncGenerator, AsyncIterator, Dict
 
 from loguru import logger
 
 from conduit.contracts.events import DispatchedEvent, EventName, KiroEvent, UnknownEvent
+from conduit.kiro.frame import FrameDecoder, FrameError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,6 +80,67 @@ def _infer_from_payload(payload_dict: Dict[str, Any]) -> str | None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+async def iter_events_from_chunks(
+    chunks: AsyncIterator[bytes],
+) -> AsyncGenerator[DispatchedEvent, None]:
+    """Decode an async byte stream into typed events, in order.
+
+    This is the streaming counterpart to :func:`dispatch_event`: it owns the
+    :class:`~conduit.kiro.frame.FrameDecoder` buffer so frames split across
+    HTTP chunk boundaries are reassembled before dispatch.
+
+    Takes a bare byte iterator rather than an HTTP response so it can be
+    tested without a transport. See :func:`iter_events` for the response-shaped
+    wrapper the doors call.
+
+    Args:
+        chunks: Async iterator of raw body bytes.
+
+    Yields:
+        One :class:`~conduit.contracts.events.KiroEvent` or
+        :class:`~conduit.contracts.events.UnknownEvent` per decoded frame.
+
+    Raises:
+        FrameError: On a CRC mismatch or structurally invalid frame. Propagated
+            deliberately — a corrupt stream is reported, never silently
+            truncated into a short-but-plausible response.
+    """
+    decoder = FrameDecoder()
+    frame_count = 0
+
+    async for chunk in chunks:
+        try:
+            frames = decoder.feed(chunk)
+        except FrameError:
+            logger.error(
+                f"dispatch: frame decode failed after {frame_count} good frame(s); "
+                f"stream is corrupt"
+            )
+            raise
+        for msg in frames:
+            frame_count += 1
+            yield dispatch_event(msg["headers"], msg["payload"])
+
+    logger.debug(f"dispatch: stream ended after {frame_count} frame(s)")
+
+
+async def iter_events(response: Any) -> AsyncGenerator[DispatchedEvent, None]:
+    """Decode a streaming Kiro HTTP response into typed events.
+
+    The door-facing entry point for Lane A. Wraps
+    :func:`iter_events_from_chunks` around ``response.aiter_bytes()``.
+
+    Args:
+        response: Any object exposing ``aiter_bytes()`` — in production an
+            ``httpx.Response`` opened with ``stream=True``.
+
+    Yields:
+        One typed event per decoded frame.
+    """
+    async for event in iter_events_from_chunks(response.aiter_bytes()):
+        yield event
 
 
 def dispatch_event(headers: Dict[str, str], payload: bytes) -> DispatchedEvent:
