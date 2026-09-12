@@ -72,15 +72,32 @@ immediately." **Both are wrong.** Verified on disk 2026-09-12:
 | Handoff claim | Reality |
 |---|---|
 | Scaffold at `CONDUIT/` | Was at `kiro-conduit/`; `CONDUIT/` held only a duplicate README. **Resolved** — consolidated into `CONDUIT/`, 27 files, no loss. |
-| `foundation/` reusable as-is | Imports itself as `kiro.*` (14 import sites). Package name does not exist. |
+| `foundation/` reusable as-is | Imports itself as `kiro.*` at 16 sites. Package name does not exist. |
 | Core has no blockers | **4 blockers**, below. Nothing can even be imported. |
 
 ### The four blockers (all owned by Lane 0)
 
-1. **Broken import prefix.** `foundation/` does `from kiro.config import …` at 14
-   sites across 7 modules (`account_manager.py:48-65`, `auth.py:44,55`,
-   `cache.py:33`, `http_client.py:41-44`, plus `config.py`, `exceptions.py`,
-   `utils.py`). There is no `kiro` package.
+*Verified by scan 2026-09-12. Each of these four causes a hard `ImportError`.*
+
+1. **Broken import prefix.** `foundation/` imports itself as `kiro.*`, and there is
+   no `kiro` package. **16 sites, 6 modules** — exact worklist, verified:
+
+   | Module | Lines | Kind |
+   |---|---|---|
+   | `account_manager.py` | 48, 49, 50, 51, 63, 64, 65 | top-level |
+   | `http_client.py` | 41, 42, 43, 44 | top-level |
+   | `auth.py` | 44, 55 | top-level |
+   | `cache.py` | 33 | top-level |
+   | `utils.py` | 35 | deferred, under `if TYPE_CHECKING:` |
+   | `exceptions.py` | 96 | deferred, inside `try/except ImportError` — **dead, delete it** |
+
+   14 are top-level and raise on import. The 2 deferred ones do not raise but must
+   still be handled: `utils.py:35` is a `TYPE_CHECKING`-only import of
+   `KiroAuthManager` (rewrite the path, it never executes at runtime), and
+   `exceptions.py:96` is dead code (see "Checked and NOT blockers" below).
+   **`config.py` is NOT in this list** — a naive `grep 'kiro\.'` appears to hit it,
+   but those matches are the URL templates (`runtime.{region}.kiro.dev`), not
+   imports. Do not "fix" them.
 2. **No `__init__.py` anywhere.** Neither `foundation/` nor the repo root is an
    importable package.
 3. **`foundation/` depends on a file marked for deletion.**
@@ -93,6 +110,35 @@ immediately." **Both are wrong.** Verified on disk 2026-09-12:
 4. **No app entry point exists.** `grep 'FastAPI('` returns nothing across the
    whole tree. There is no `main.py`, no app factory, no router registration, no
    `pyproject.toml`, no `requirements.txt`. The server was never copied.
+
+### Checked and NOT blockers — do not spend time re-deriving these
+
+A deeper scan (deferred imports, symbol-level resolution) turned up one loose end
+and cleared three suspicions. Recorded so Lane 0 doesn't re-investigate:
+
+- **`from kiro.debug_logger import debug_logger` at `foundation/exceptions.py:96`
+  is dead code, not a blocker.** It sits inside `try: … except ImportError: pass`,
+  so it degrades silently. `debug_logger.py` was never copied into this repo (it
+  exists in neither `foundation/` nor `_reference_upstream/`), so the branch can
+  never fire. **Lane 0 deletes the dead block** — it is the only remaining `kiro.*`
+  reference after the rewrite, and leaving it means `grep` never comes back clean.
+  Note `_reference_upstream/` references it 77 more times across the route and
+  streaming modules; those files are all slated for deletion by Lanes C and D, so
+  no action there.
+- **`kiro.dev` is not a module.** It appears in a module-name scan only as a false
+  positive from the URL templates (`runtime.{region}.kiro.dev`,
+  `prod.{region}.auth.desktop.kiro.dev`). Ignore it.
+- **The import rewrite is purely mechanical.** All **25** symbols that `foundation/`
+  imports from `kiro.config` are verified present in `config.py` — 20 constants and
+  5 host-builder functions. No missing constant is hiding behind the broken prefix.
+- **The `model_resolver` rescue is self-contained.** It needs only
+  `kiro.cache.ModelInfoCache` (under `TYPE_CHECKING`, so not even a runtime import)
+  and `kiro.config.FALLBACK_MODELS` — both already in `foundation/`. Rescuing it
+  drags nothing else out of `_reference_upstream/`.
+- **Dependencies are satisfied.** `fastapi`, `httpx`, `pydantic`, `loguru`,
+  `python-dotenv` all import cleanly on system Python 3.14.3. `foundation/` needs no
+  third-party package beyond those five. There is no venv in the repo — Lane 0
+  should create one, but nothing is missing.
 
 ### What IS correct and reusable
 
@@ -327,8 +373,12 @@ README status line.
 **Tasks:**
 1. Create `conduit/` package. Move `foundation/` → `conduit/foundation/`, add
    `__init__.py` at every level.
-2. **Rewrite all 14 `kiro.*` imports to `conduit.foundation.*`** (sites listed in
-   §1.1). Move `config.py` to `conduit/config.py` and point imports there.
+2. **Rewrite all 16 `kiro.*` imports to `conduit.foundation.*`** — exact
+   file:line worklist in the blocker-1 table in §1. Move `config.py` to
+   `conduit/config.py` and point imports there. Delete the dead
+   `exceptions.py:96` block rather than rewriting it. All **44** symbols these
+   imports pull are verified present in their target modules, so this is a
+   mechanical path rewrite with no missing definitions to chase.
 3. **Rescue `_reference_upstream/model_resolver.py` → `conduit/foundation/model_resolver.py`.**
    It is a hard dependency of `account_manager.py:50` (used at `:160,559,708,797`).
    Keep `ModelResolver`, `normalize_model_name`, `to_runtime_model_id`,
@@ -351,10 +401,21 @@ README status line.
    name unchanged — `foundation/` reads them and existing `.env` files depend on
    them.
 
-**Gate:** `python -c "import conduit; from conduit.app import create_app; create_app()"`
-succeeds. `pytest tests/contracts` passes (assert every contract type imports and
-round-trips through `dataclasses.asdict`). `grep -rn "^from kiro\|^import kiro" conduit/`
-returns nothing.
+**Gate:**
+1. `python -c "import conduit; from conduit.app import create_app; create_app()"`
+   succeeds.
+2. `pytest tests/contracts` passes — assert every contract type imports and
+   round-trips through `dataclasses.asdict`.
+3. **`grep -rnE '(from|import)[[:space:]]+kiro\.' conduit/` returns nothing.**
+   Use exactly this pattern — **not** a `^`-anchored one. A line-anchored grep
+   silently misses the two indented imports (`utils.py:35` under `TYPE_CHECKING`,
+   `exceptions.py:96` inside `try`) and would let this gate pass with the package
+   still half-broken. The `(from|import)` prefix is what keeps the
+   `runtime.{region}.kiro.dev` URL templates in `config.py` from false-triggering.
+4. Import every foundation module individually, not just the package:
+   `python -c "import importlib; [importlib.import_module(f'conduit.foundation.{m}') for m in ['auth','account_manager','cache','config','http_client','utils','exceptions','account_errors','kiro_errors','network_errors','model_resolver']]"`.
+   Step 1 alone does not prove this — `conduit/__init__.py` need not import them,
+   so a broken module can hide behind a passing package import.
 
 **Do NOT:** implement any parsing, translation, door, or emit logic. Lane 0 is
 plumbing and contracts only. Do not delete anything from `_reference_upstream/`
