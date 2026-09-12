@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conduit"
+version = "0.1.0"
+description = "A translating gateway between model-native harnesses and the Kiro / AWS CodeWhisperer backend"
+requires-python = ">=3.13"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [
+    "fastapi",
+    "httpx",
+    "pydantic",
+    "loguru",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+include = ["conduit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

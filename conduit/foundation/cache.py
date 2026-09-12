@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS
+from conduit.config import MODEL_CACHE_TTL, DEFAULT_MAX_INPUT_TOKENS
 
 
 class ModelInfoCache:

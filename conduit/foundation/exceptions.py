@@ -89,17 +89,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     # Log body at DEBUG level to avoid cluttering console with potentially large payloads
     # logger.debug(f"Request body: {body_str[:500]}...")
     
-    # Flush debug logs for validation errors
-    # This is called AFTER middleware has initialized debug logging,
-    # so all app logs during request processing will be captured
-    try:
-        from kiro.debug_logger import debug_logger
-        if debug_logger:
-            error_message = f"Validation error: {sanitized_errors}"
-            debug_logger.flush_on_error(422, error_message)
-    except ImportError:
-        pass  # debug_logger not available
-    
     return JSONResponse(
         status_code=422,
         content={"detail": sanitized_errors, "body": body_str[:500]},

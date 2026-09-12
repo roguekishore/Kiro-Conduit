@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, List, Dict, Any
 from loguru import logger
 
 if TYPE_CHECKING:
-    from kiro.auth import KiroAuthManager
+    from conduit.foundation.auth import KiroAuthManager
 
 
 def get_machine_fingerprint() -> str:

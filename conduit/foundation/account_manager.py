@@ -45,10 +45,10 @@ from typing import Dict, List, Optional
 import httpx
 from loguru import logger
 
-from kiro.auth import KiroAuthManager, AuthType, resolve_profile_arn
-from kiro.cache import ModelInfoCache
-from kiro.model_resolver import ModelResolver, normalize_model_name
-from kiro.config import (
+from conduit.foundation.auth import KiroAuthManager, AuthType, resolve_profile_arn
+from conduit.foundation.cache import ModelInfoCache
+from conduit.foundation.model_resolver import ModelResolver, normalize_model_name
+from conduit.config import (
     HIDDEN_MODELS,
     MODEL_ALIASES,
     HIDDEN_FROM_LIST,
@@ -60,9 +60,9 @@ from kiro.config import (
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
 )
-from kiro.utils import get_kiro_headers
-from kiro.account_errors import ErrorType
-from kiro.http_client import KiroHttpClient
+from conduit.foundation.utils import get_kiro_headers
+from conduit.foundation.account_errors import ErrorType
+from conduit.foundation.http_client import KiroHttpClient
 
 
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:

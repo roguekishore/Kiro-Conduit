@@ -41,7 +41,7 @@ from typing import Optional
 import httpx
 from loguru import logger
 
-from kiro.config import (
+from conduit.config import (
     TOKEN_REFRESH_THRESHOLD,
     SQLITE_READONLY,
     PROFILE_DISCOVERY_AMZ_TARGET,
@@ -52,7 +52,7 @@ from kiro.config import (
     get_kiro_profile_url,
     get_aws_sso_oidc_url,
 )
-from kiro.utils import get_machine_fingerprint, get_kiro_headers
+from conduit.foundation.utils import get_machine_fingerprint, get_kiro_headers
 
 
 # Supported SQLite token keys (searched in priority order)

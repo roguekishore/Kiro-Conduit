@@ -38,10 +38,10 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
-from kiro.auth import KiroAuthManager
-from kiro.utils import get_kiro_headers
-from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+from conduit.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from conduit.foundation.auth import KiroAuthManager
+from conduit.foundation.utils import get_kiro_headers
+from conduit.foundation.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
 
 
 class KiroHttpClient:

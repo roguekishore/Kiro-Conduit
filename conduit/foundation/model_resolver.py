@@ -38,12 +38,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 from loguru import logger
 
 if TYPE_CHECKING:
-    from kiro.cache import ModelInfoCache
+    from conduit.foundation.cache import ModelInfoCache
 
 
 # Valid model IDs accepted by runtime.{region}.kiro.dev
 # Generated from FALLBACK_MODELS to maintain single source of truth
-from kiro.config import FALLBACK_MODELS
+from conduit.config import FALLBACK_MODELS
 
 VALID_RUNTIME_MODEL_IDS: set = {model["modelId"] for model in FALLBACK_MODELS}
 
