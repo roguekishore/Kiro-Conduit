@@ -29,7 +29,12 @@ from typing import Any, AsyncGenerator, AsyncIterable, Dict, Optional
 from loguru import logger
 
 from conduit.contracts.events import DispatchedEvent, EventName, KiroEvent, UnknownEvent
-from conduit.contracts.metrics import StopReason, TurnMetrics
+from conduit.contracts.metrics import ReasoningBlockMeta, StopReason, TurnMetrics
+from conduit.kiro.usage import (
+    apply_context_usage_event,
+    apply_metadata_event,
+    apply_metering_event,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +229,15 @@ async def stream_to_anthropic_sse(
                 if not thinking_open:
                     async for chunk in _open_thinking():
                         yield chunk
+                    # One ReasoningBlockMeta per BLOCK, appended as the block
+                    # opens. reasoningContentEvent arrives as MANY deltas per
+                    # block, so appending per delta would inflate the count the
+                    # seam reports; appending only when a signature arrives
+                    # would make an unsigned block invisible to the seam
+                    # entirely. Lane A's apply_reasoning_content_event() is
+                    # per-event by design and is deliberately not used here —
+                    # block boundaries are known only at this layer.
+                    metrics.reasoning_blocks.append(ReasoningBlockMeta())
 
                 if thinking_text:
                     yield _sse("content_block_delta", {
@@ -232,6 +246,15 @@ async def stream_to_anthropic_sse(
                         "delta": {"type": "thinking_delta", "thinking": thinking_text},
                     })
 
+                # Enrich the open block's metadata as deltas carry it.
+                if metrics.reasoning_blocks:
+                    _blk = metrics.reasoning_blocks[-1]
+                    _model_id = payload.get("modelId") or payload.get("model_id")
+                    if _model_id and not _blk.model_id:
+                        _blk.model_id = str(_model_id)
+                    if signature:
+                        _blk.signature_present = True
+
                 # Forward real signature verbatim — never fabricate
                 if signature:
                     yield _sse("content_block_delta", {
@@ -239,12 +262,6 @@ async def stream_to_anthropic_sse(
                         "index": thinking_idx,
                         "delta": {"type": "signature_delta", "signature": signature},
                     })
-
-                    # Track signature presence in metrics
-                    from conduit.contracts.metrics import ReasoningBlockMeta
-                    metrics.reasoning_blocks.append(
-                        ReasoningBlockMeta(signature_present=True)
-                    )
 
             # ------------------------------------------------------------------
             # toolUseEvent → complete tool_use block
@@ -292,32 +309,32 @@ async def stream_to_anthropic_sse(
             # ------------------------------------------------------------------
             # metadataEvent → populate TurnMetrics counters
             # ------------------------------------------------------------------
+            # Lane A owns every wire field name. Hand-rolling the mapping here
+            # is what made this path report zeros while exact counts were on
+            # the wire: it read cacheCreationInputTokens (an Anthropic name,
+            # not Kiro's), summed total_tokens instead of reading totalTokens,
+            # and never read thoughtTokens at all. Lane A also handles BOTH
+            # cache-field spellings the wire may use.
             elif name == EventName.METADATA:
-                usage = payload.get("tokenUsage") or {}
-                metrics.input_tokens  = int(usage.get("inputTokens", metrics.input_tokens))
-                metrics.output_tokens = int(usage.get("outputTokens", metrics.output_tokens))
-                metrics.cache_read_tokens  = int(usage.get("cacheReadInputTokens", metrics.cache_read_tokens))
-                metrics.cache_write_tokens = int(usage.get("cacheCreationInputTokens", metrics.cache_write_tokens))
-                metrics.total_tokens = metrics.input_tokens + metrics.output_tokens
+                apply_metadata_event(metrics, payload)
                 logger.debug(
                     f"[anthropic_sse] metadataEvent: in={metrics.input_tokens} "
-                    f"out={metrics.output_tokens} cr={metrics.cache_read_tokens} "
-                    f"cw={metrics.cache_write_tokens}"
+                    f"out={metrics.output_tokens} thought={metrics.thought_tokens} "
+                    f"cr={metrics.cache_read_tokens} cw={metrics.cache_write_tokens} "
+                    f"total={metrics.total_tokens}"
                 )
 
             # ------------------------------------------------------------------
             # meteringEvent → credits
             # ------------------------------------------------------------------
             elif name == EventName.METERING:
-                metrics.credits = float(payload.get("credits", metrics.credits))
+                apply_metering_event(metrics, payload)
 
             # ------------------------------------------------------------------
             # contextUsageEvent → context_usage_percentage
             # ------------------------------------------------------------------
             elif name == EventName.CONTEXT_USAGE:
-                pct = payload.get("contextWindowPercentage")
-                if pct is not None:
-                    metrics.context_usage_percentage = float(pct)
+                apply_context_usage_event(metrics, payload)
 
             # ------------------------------------------------------------------
             # messageStopEvent → stop reason

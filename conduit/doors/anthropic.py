@@ -32,7 +32,7 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security
@@ -45,10 +45,20 @@ from conduit.config import (
     PROXY_API_KEY,
 )
 from conduit.contracts.events import DispatchedEvent, EventName, KiroEvent, UnknownEvent
-from conduit.contracts.metrics import TurnMetrics
+from conduit.contracts.metrics import ReasoningBlockMeta, TurnMetrics
 from conduit.contracts.rewritten import RewrittenOut
 from conduit.contracts.seam import SeamEnvelope
 from conduit.doors.anthropic_sse import stream_to_anthropic_sse
+from conduit.kiro.dispatch import iter_events
+from conduit.kiro.history import HistoryMessage
+from conduit.kiro.request import build_conversation_state
+from conduit.kiro.tools import build_tool_results_from_anthropic
+from conduit.kiro.usage import (
+    apply_context_usage_event,
+    apply_metadata_event,
+    apply_metering_event,
+)
+from conduit.seam.emit import emit
 from conduit.foundation.auth import resolve_profile_arn
 from conduit.foundation.http_client import KiroHttpClient
 
@@ -176,178 +186,199 @@ async def _verify_key(
 
 
 # ---------------------------------------------------------------------------
-# Lane B interface stub
+# Lane B adapter — Anthropic wire format -> Lane B's HistoryMessage pipeline
 # ---------------------------------------------------------------------------
+
+def _extract_system_prompt(system: Optional[Union[str, List[Any]]]) -> Optional[str]:
+    """Flatten Anthropic's `system` field (string or block list) to one string."""
+    if system is None:
+        return None
+    if isinstance(system, str):
+        return system or None
+    parts: List[str] = []
+    for blk in system:
+        if isinstance(blk, dict):
+            if blk.get("type", "text") == "text":
+                parts.append(blk.get("text", ""))
+        elif hasattr(blk, "text"):
+            parts.append(getattr(blk, "text") or "")
+    joined = "\n".join(t for t in parts if t)
+    return joined or None
+
+
+def _blocks_of(content: Union[str, List[Any]]) -> List[Dict[str, Any]]:
+    """Normalize message content to a list of plain block dicts."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    out: List[Dict[str, Any]] = []
+    for blk in content:
+        if isinstance(blk, dict):
+            out.append(blk)
+        elif hasattr(blk, "model_dump"):
+            out.append(blk.model_dump())
+        elif hasattr(blk, "type"):
+            out.append({"type": getattr(blk, "type"), "text": getattr(blk, "text", "")})
+    return out
+
+
+def _effort_from_thinking(thinking: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Map Anthropic's thinking budget onto Kiro's effort enum.
+
+    Anthropic expresses reasoning as a TOKEN BUDGET; Kiro takes an EFFORT ENUM
+    (low/medium/high/xhigh/max). There is no lossless mapping between them, so
+    this is an explicit, documented heuristic — not a protocol fact.
+
+    Note the direction: upstream's defect was the reverse (converting an effort
+    request into an Anthropic-style budget to send to Kiro, which takes no
+    budget). Here the budget is what the harness sent us and the enum is what
+    the wire needs.
+
+    Returns None when thinking is absent or disabled, letting Lane B apply its
+    own default.
+    """
+    if not thinking:
+        return None
+    if thinking.get("type") not in ("enabled", "adaptive", None):
+        return None
+    budget = thinking.get("budget_tokens")
+    if not isinstance(budget, int):
+        return None
+    if budget < 4096:
+        return "low"
+    if budget < 8192:
+        return "medium"
+    if budget < 16384:
+        return "high"
+    if budget < 32768:
+        return "xhigh"
+    return "max"
+
+
+def _to_history_messages(
+    messages: List[_Message],
+) -> List[HistoryMessage]:
+    """Convert Anthropic messages to Lane B's HistoryMessage list.
+
+    Per-role handling:
+      - user turns: text is joined; `tool_result` blocks go through Lane B's
+        `build_tool_results_from_anthropic`, which reads `is_error` so the Kiro
+        `status` field is truthful (the §5b-bis fix). Base64 images are carried;
+        URL images are reported, not silently dropped.
+      - assistant turns: text is joined; `tool_use` blocks become Kiro
+        `toolUses`. `thinking` blocks are intentionally dropped — Kiro's
+        assistantResponseMessage has no slot for them, and a reasoning
+        signature is a provider-specific blob that must not be relayed.
+
+    System-role messages are skipped: the caller extracts the system prompt
+    separately, since Kiro carries it in its own `systemPrompt` slot.
+    """
+    out: List[HistoryMessage] = []
+
+    for msg in messages:
+        if msg.role == "system":
+            continue
+
+        blocks = _blocks_of(msg.content)
+        text_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        images: List[Dict[str, Any]] = []
+
+        for blk in blocks:
+            btype = blk.get("type", "text")
+
+            if btype == "text":
+                if blk.get("text"):
+                    text_parts.append(blk["text"])
+
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "toolUseId": blk.get("id", ""),
+                    "name": blk.get("name", ""),
+                    "input": blk.get("input", {}) or {},
+                })
+
+            elif btype == "image":
+                source = blk.get("source") or {}
+                if source.get("type") == "base64":
+                    images.append({
+                        "media_type": source.get("media_type", "image/png"),
+                        "data": source.get("data", ""),
+                    })
+                else:
+                    logger.warning(
+                        "[anthropic] URL-based image dropped (Kiro cannot fetch "
+                        "remote images); the model is not shown this image"
+                    )
+
+            # tool_result blocks are handled below, via Lane B's converter.
+            # thinking / redacted_thinking are dropped: no Kiro slot, and the
+            # signature is a provider-specific blob that must not be relayed.
+
+        tool_results = build_tool_results_from_anthropic(msg.content) or None
+
+        out.append(HistoryMessage(
+            role=msg.role,
+            content="\n".join(text_parts),
+            tool_calls=tool_calls or None,
+            tool_results=tool_results,
+            images=images or None,
+        ))
+
+    return out
+
 
 def _build_kiro_payload(
     request_data: AnthropicMessagesRequest,
     conversation_id: str,
     profile_arn: Optional[str],
-) -> dict:
-    """Lane B stub: builds a minimal Kiro conversationState payload.
+) -> Tuple[dict, RewrittenOut]:
+    """Build the Kiro payload via Lane B, returning it with its RewrittenOut.
 
-    TODO: replace with ``from conduit.kiro.request import build_kiro_payload``
-          once Lane B ships.  The interface is:
-            build_kiro_payload(
-                request_data: AnthropicMessagesRequest,
-                conversation_id: str,
-                profile_arn: Optional[str],
-            ) -> dict
+    This is the Lane C -> Lane B seam. It calls Lane B directly and does NOT
+    swallow failures: a broken seam must surface as an error, not degrade to a
+    silently-wrong payload.
+
+    Returns:
+        (wire_payload, rewritten_out) — rewritten_out declares every injection
+        Lane B made and is handed to the seam emit verbatim.
     """
-    try:
-        from conduit.kiro.request import build_kiro_payload  # Lane B
-        return build_kiro_payload(request_data, conversation_id, profile_arn)
-    except ImportError:
-        pass
+    system_prompt = _extract_system_prompt(request_data.system)
+    history_messages = _to_history_messages(request_data.messages)
 
-    # Minimal stub — produces a valid Kiro generateAssistantResponse body
-    # so the door can be wired up and tested without Lane B.
-    history: List[Dict[str, Any]] = []
-    for msg in request_data.messages[:-1]:
-        if isinstance(msg.content, str):
-            content_str = msg.content
-        else:
-            content_str = " ".join(
-                b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
-                for b in msg.content
-                if (isinstance(b, dict) and b.get("type") == "text")
-                or (hasattr(b, "type") and getattr(b, "type") == "text")
-            )
-        history.append({"role": msg.role, "content": content_str})
+    tools: Optional[List[Dict[str, Any]]] = None
+    if request_data.tools:
+        tools = [
+            t if isinstance(t, dict) else t.model_dump(exclude_none=True)
+            for t in request_data.tools
+        ]
 
-    last_msg = request_data.messages[-1]
-    if isinstance(last_msg.content, str):
-        current_content = last_msg.content
-    else:
-        current_content = " ".join(
-            b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
-            for b in last_msg.content
-            if (isinstance(b, dict) and b.get("type") == "text")
-            or (hasattr(b, "type") and getattr(b, "type") == "text")
-        )
-
-    system_prompt = None
-    if isinstance(request_data.system, str):
-        system_prompt = request_data.system
-    elif isinstance(request_data.system, list):
-        system_prompt = " ".join(
-            b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
-            for b in request_data.system
-        )
-
-    payload: Dict[str, Any] = {
-        "conversationState": {
-            "conversationId": conversation_id,
-            "history": history,
-            "currentMessage": {
-                "userInputMessage": {
-                    "content": current_content,
-                    "modelId": request_data.model,
-                }
-            },
-        }
-    }
-    if profile_arn:
-        payload["profileArn"] = profile_arn
-    if system_prompt:
-        payload["conversationState"]["systemPrompt"] = {"content": system_prompt}
-
-    return payload
+    return build_conversation_state(
+        messages=history_messages,
+        system_prompt=system_prompt,
+        model_id=request_data.model,
+        tools=tools,
+        conversation_id=conversation_id,
+        profile_arn=profile_arn,
+        reasoning_effort=_effort_from_thinking(request_data.thinking),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Kiro event-stream parser
 # ---------------------------------------------------------------------------
 
-async def _parse_kiro_events(
-    response: httpx.Response,
-) -> asyncio.Queue:
-    """Not used directly; events are yielded inline in the route handler."""
-    raise NotImplementedError
-
-
 async def _iter_kiro_events(
     response: httpx.Response,
-) -> asyncio.AsyncGenerator[DispatchedEvent, None]:
-    """Parse a Kiro AWS event-stream response into DispatchedEvent objects.
+) -> AsyncGenerator[DispatchedEvent, None]:
+    """Parse a Kiro AWS event-stream response into typed events.
 
-    This is the Lane A boundary — in production, Lane A provides
-    ``conduit.kiro.dispatch.iter_events(response)``.  Until Lane A is wired,
-    this minimal inline parser keeps the door functional.
+    Thin delegation to Lane A, which owns frame decoding and `:event-type`
+    dispatch. Deliberately has no fallback parser: if Lane A's contract breaks,
+    that must surface loudly rather than degrade to a second, divergent
+    implementation of the same protocol.
     """
-    try:
-        from conduit.kiro.dispatch import iter_events  # Lane A
-        async for ev in iter_events(response):
-            yield ev
-        return
-    except ImportError:
-        pass
-
-    # -----------------------------------------------------------------------
-    # Minimal inline AWS event-stream parser (Lane A stub)
-    # Handles the binary framing used by Kiro's generateAssistantResponse.
-    # -----------------------------------------------------------------------
-    import struct
-
-    buffer = b""
-
-    async for chunk in response.aiter_bytes():
-        buffer += chunk
-
-        while len(buffer) >= 12:
-            # Prelude: total_length(4) + headers_length(4) + prelude_crc(4)
-            total_len = struct.unpack(">I", buffer[:4])[0]
-            if len(buffer) < total_len:
-                break
-
-            frame = buffer[:total_len]
-            buffer = buffer[total_len:]
-
-            # headers_length tells us where headers end
-            headers_len = struct.unpack(">I", frame[4:8])[0]
-            headers_raw = frame[12 : 12 + headers_len]
-            payload_raw = frame[12 + headers_len : total_len - 4]  # strip trailing CRC
-
-            # Parse headers
-            headers: Dict[str, str] = {}
-            pos = 0
-            while pos < len(headers_raw):
-                if pos >= len(headers_raw):
-                    break
-                name_len = headers_raw[pos]
-                pos += 1
-                name = headers_raw[pos : pos + name_len].decode("utf-8", errors="replace")
-                pos += name_len
-                value_type = headers_raw[pos]
-                pos += 1
-                if value_type == 7:  # string
-                    val_len = struct.unpack(">H", headers_raw[pos : pos + 2])[0]
-                    pos += 2
-                    val = headers_raw[pos : pos + val_len].decode("utf-8", errors="replace")
-                    pos += val_len
-                    headers[name] = val
-                else:
-                    # Skip unknown header value types
-                    break
-
-            event_type = headers.get(":event-type", "")
-            if not event_type:
-                continue
-
-            # Decode JSON payload
-            payload: Dict[str, Any] = {}
-            if payload_raw:
-                try:
-                    payload = json.loads(payload_raw.decode("utf-8", errors="replace"))
-                except json.JSONDecodeError:
-                    pass
-
-            # Map to typed event
-            try:
-                ename = EventName(event_type)
-                yield KiroEvent(name=ename, payload=payload)
-            except ValueError:
-                yield UnknownEvent(name=event_type, payload=payload)
+    async for event in iter_events(response):
+        yield event
 
 
 # ---------------------------------------------------------------------------
@@ -355,18 +386,14 @@ async def _iter_kiro_events(
 # ---------------------------------------------------------------------------
 
 def _fire_seam_emit(envelope: SeamEnvelope) -> None:
-    """Fire-and-forget emit to Lane F's seam.
+    """Hand the turn to Lane F's seam emitter.
 
-    TODO: replace stub with real ``from conduit.seam import emit; emit(envelope)``
-          once Lane F ships.
+    `emit()` is itself fire-and-forget: it enqueues and returns, never blocks,
+    never raises. So this is a direct call, not a guarded one — the seam
+    contract's non-blocking invariant lives in Lane F, and wrapping it here in
+    a broad `except` would only hide a genuinely broken seam.
     """
-    try:
-        from conduit.seam import emit  # Lane F
-        # emit is sync fire-and-forget per contract
-        asyncio.get_event_loop().call_soon(lambda: None)  # placeholder
-        emit(envelope)
-    except (ImportError, Exception) as exc:
-        logger.debug(f"[anthropic] seam emit skipped: {exc}")
+    emit(envelope)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +440,23 @@ async def messages(
                 },
             )
     else:
-        account = account_manager.get_first_account()
+        # Legacy single-account mode — and note ACCOUNT_SYSTEM defaults to false,
+        # so this is the DEFAULT path. Unlike get_next_account(), this one does
+        # not lazily initialize; it raises RuntimeError until something has
+        # initialized an account. That is an expected operational state (no
+        # credentials configured yet), so it becomes a 503 rather than an
+        # uncaught RuntimeError surfacing as a 500.
+        try:
+            account = account_manager.get_first_account()
+        except RuntimeError as exc:
+            logger.error(f"[anthropic] no initialized account: {exc}")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(exc)},
+                },
+            )
 
     auth_manager = account.auth_manager
     if auth_manager is None:
@@ -432,7 +475,9 @@ async def messages(
     profile_arn = await resolve_profile_arn(auth_manager, PROFILE_ARN)
 
     try:
-        kiro_payload = _build_kiro_payload(request_data, conversation_id, profile_arn)
+        kiro_payload, rewritten_out = _build_kiro_payload(
+            request_data, conversation_id, profile_arn
+        )
     except (ValueError, TypeError) as exc:
         logger.error(f"[anthropic] payload build error: {exc}")
         return JSONResponse(
@@ -540,7 +585,7 @@ async def messages(
                         ts=int(time.time() * 1000),
                         model_id=request_data.model,
                         metrics=metrics,
-                        rewritten_out=RewrittenOut(),  # Lane B populates; stub for now
+                        rewritten_out=rewritten_out,
                     ))
 
         return StreamingResponse(
@@ -578,6 +623,19 @@ async def messages(
             sig = payload.get("signature")
             if sig:
                 thinking_sig_buf = sig
+            # reasoningContentEvent arrives as MANY deltas per thinking
+            # block, so record ONE ReasoningBlockMeta for the block and enrich
+            # it as later deltas carry modelId / signature. Lane A's
+            # apply_reasoning_content_event() appends per event by design,
+            # which would inflate the count the seam reports.
+            if not metrics.reasoning_blocks:
+                metrics.reasoning_blocks.append(ReasoningBlockMeta())
+            _blk = metrics.reasoning_blocks[-1]
+            _model_id = payload.get("modelId") or payload.get("model_id")
+            if _model_id and not _blk.model_id:
+                _blk.model_id = str(_model_id)
+            if sig:
+                _blk.signature_present = True
 
         elif name == EventName.ASSISTANT_RESPONSE:
             text_buf += payload.get("content", "")
@@ -590,21 +648,22 @@ async def messages(
                 "input": payload.get("input", {}),
             })
 
+        # Metrics are parsed by Lane A, never hand-rolled here. Lane A owns
+        # every wire field name — including thoughtTokens and BOTH cache-field
+        # spellings (cachedReadTokens / cacheReadInputTokens), which the wire
+        # may use interchangeably. Duplicating that mapping here is how the
+        # non-streaming path silently reported zeros while exact counts were on
+        # the wire: it read cacheCreationInputTokens (an Anthropic name, not
+        # Kiro's), took credits from the wrong key, and never read
+        # thoughtTokens at all.
         elif name == EventName.METADATA:
-            usage = payload.get("tokenUsage") or {}
-            metrics.input_tokens  = int(usage.get("inputTokens", 0))
-            metrics.output_tokens = int(usage.get("outputTokens", 0))
-            metrics.cache_read_tokens  = int(usage.get("cacheReadInputTokens", 0))
-            metrics.cache_write_tokens = int(usage.get("cacheCreationInputTokens", 0))
-            metrics.total_tokens = metrics.input_tokens + metrics.output_tokens
+            apply_metadata_event(metrics, payload)
 
         elif name == EventName.METERING:
-            metrics.credits = float(payload.get("credits", 0.0))
+            apply_metering_event(metrics, payload)
 
         elif name == EventName.CONTEXT_USAGE:
-            pct = payload.get("contextWindowPercentage")
-            if pct is not None:
-                metrics.context_usage_percentage = float(pct)
+            apply_context_usage_event(metrics, payload)
 
         elif name == EventName.MESSAGE_STOP:
             kiro_reason = payload.get("stopReason")
@@ -642,7 +701,7 @@ async def messages(
         ts=int(time.time() * 1000),
         model_id=request_data.model,
         metrics=metrics,
-        rewritten_out=RewrittenOut(),
+        rewritten_out=rewritten_out,
     ))
 
     usage_out: Dict[str, Any] = {
