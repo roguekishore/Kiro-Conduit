@@ -61,4 +61,10 @@ that contract, not against each other's internals.
 
 ## Status
 
-Scaffold only. Foundation copied; rewrites not started. Do not run yet.
+**Lane 0 done; Lanes A–F open.** The package is importable, `create_app()` builds,
+and `conduit/contracts/` is frozen — so the six build lanes can run in parallel.
+Lane briefs, file ownership, and per-lane verification gates are in
+`SPEC-WORKSTREAMS.md`.
+
+No Kiro protocol code is implemented yet, and nothing has run against real
+credentials — that step is maintainer-gated. Don't point a harness at this yet.

@@ -13,23 +13,45 @@ needs to re-derive the protocol.
 
 ## 0. Orchestrator instructions — read this first
 
-### The fan-out is NOT flat. There is one blocking lane.
+### ✅ STATUS: LANE 0 IS DONE. Dispatch A–F now.
+
+Lane 0 landed in commits `2dadf6b` + `5f745e3`. **Do not redo it.** All four
+blockers in §1 are cleared and all four of its gates pass:
+
+- `conduit/` is an importable package; `create_app()` builds, 9 routes.
+- All 16 `kiro.*` imports rewritten; unanchored scan is clean.
+- `model_resolver.py` rescued into `conduit/foundation/`.
+- `conduit/contracts/` is written and frozen; 16 contract tests pass.
+- Dead `debug_logger` block deleted; `APP_TITLE`/`APP_DESCRIPTION` rebranded.
+
+**Lanes A–F are unblocked and fully parallel. Dispatch all six now — one agent
+per lane.** Their briefs are in §5. §1 is kept as the record of what Lane 0
+fixed; read it for context, not as work to do.
+
+Two notes carried forward:
+- **`conduit/contracts/` is frozen.** Import from it, never redefine or reshape
+  it. `tests/contracts/test_contracts.py` will fail if a lane drifts. If a lane
+  believes a contract is wrong, it **stops and reports** rather than editing.
+- **No venv in the repo.** All five deps import on system Python 3.14.3, so
+  nothing is missing. Create one if you prefer isolation; it is gitignored.
+
+### The fan-out is NOT flat. There was one blocking lane.
 
 ```
-LANE 0 (blocker, runs ALONE to completion)
-   │  repo is not importable today; 4 hard blockers, see §1
+LANE 0  ✅ DONE (2dadf6b, 5f745e3) — was the blocker; ran alone
+   │  cleared 4 hard blockers, froze conduit/contracts/
    ▼
 ┌──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
 │  LANE A  │  LANE B  │  LANE C  │  LANE D  │  LANE E  │  LANE F  │
 │ response │ request  │Anthropic │  Codex   │ control  │   SAGA   │
 │  parse   │  build   │   door   │   door   │  plane   │   seam   │
 └──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
-        all six run fully in parallel after Lane 0 lands
+     ↑ all six unblocked NOW, fully parallel, one agent each
 ```
 
-**Do not dispatch A–F until Lane 0 is merged and `python -c "import conduit"`
-succeeds.** Lane 0 creates the type contracts every other lane imports. Dispatch
-A–F before it exists and six agents will each invent an incompatible `TurnMetrics`.
+Lane 0 had to run alone because it creates the type contracts every other lane
+imports — dispatched early, six agents would each have invented an incompatible
+`TurnMetrics`. That risk is now retired: the contracts exist and are frozen.
 
 Lanes A–F are parallel because Lane 0 freezes their shared types as real,
 importable dataclasses. C and D consume A's and B's output *through those types*,
@@ -360,7 +382,10 @@ class SeamEnvelope:
 
 ## 5. Lane briefs
 
-### LANE 0 — Package rehab + contracts + app skeleton  ⛔ BLOCKER, RUNS ALONE
+### LANE 0 — Package rehab + contracts + app skeleton  ✅ DONE (2dadf6b, 5f745e3)
+
+*Kept as the record of what landed and why. Nothing here is outstanding work.
+Read it to understand the contracts you import; do not re-execute it.*
 
 **Why first:** the repo cannot be imported. Six parallel lanes would each invent
 their own shared types.
