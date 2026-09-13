@@ -73,11 +73,23 @@ def _end_turn_sequence(extra_text: str = "Hello.") -> List[KiroEvent]:
         KiroEvent(EventName.ASSISTANT_RESPONSE, {"content": extra_text}),
         KiroEvent(
             EventName.METADATA,
-            {"tokenUsage": {"inputTokens": 20, "outputTokens": 8, "thinkingTokens": 0}},
+            # Kiro's real shape: cache counts ride in metadataEvent.tokenUsage,
+            # reasoning is `thoughtTokens` (not `thinkingTokens`), and
+            # totalTokens is sent explicitly — it is read, never summed, because
+            # a sum of input+output silently omits thought tokens.
+            {"tokenUsage": {
+                "inputTokens": 20,
+                "outputTokens": 8,
+                "thoughtTokens": 0,
+                "cacheReadInputTokens": 4,
+                "cacheWriteInputTokens": 2,
+                "totalTokens": 28,
+            }},
         ),
         KiroEvent(
             EventName.CONTEXT_USAGE,
-            {"cacheReadTokens": 4, "cacheWriteTokens": 2},
+            # contextUsageEvent carries the window percentage, not cache counts.
+            {"contextUsagePercentage": 12.5},
         ),
         KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "END_TURN"}),
     ]

@@ -238,7 +238,7 @@ async def test_thinking_without_signature_no_signature_delta():
         yield KiroEvent(EventName.ASSISTANT_RESPONSE, {"content": "the answer"})
         yield KiroEvent(EventName.METADATA, {
             "tokenUsage": {"inputTokens": 10, "outputTokens": 5,
-                           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                           "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}
         })
         yield KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "END_TURN"})
 
@@ -367,7 +367,7 @@ async def test_multiple_tool_calls_emit_multiple_blocks():
         })
         yield KiroEvent(EventName.METADATA, {
             "tokenUsage": {"inputTokens": 50, "outputTokens": 20,
-                           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                           "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}
         })
         yield KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "TOOL_USE"})
 
@@ -394,7 +394,7 @@ async def test_unknown_events_skipped():
         yield UnknownEvent(name="supplementaryWebLinksEvent", payload={})
         yield KiroEvent(EventName.METADATA, {
             "tokenUsage": {"inputTokens": 5, "outputTokens": 5,
-                           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                           "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}
         })
         yield KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "END_TURN"})
 
@@ -480,7 +480,7 @@ async def test_empty_text_chunks_not_emitted():
         yield KiroEvent(EventName.ASSISTANT_RESPONSE, {"content": ""})
         yield KiroEvent(EventName.METADATA, {
             "tokenUsage": {"inputTokens": 5, "outputTokens": 5,
-                           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                           "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}
         })
         yield KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "END_TURN"})
 
@@ -499,10 +499,10 @@ async def test_empty_text_chunks_not_emitted():
 async def test_metering_event_updates_credits():
     async def _with_metering():
         yield KiroEvent(EventName.ASSISTANT_RESPONSE, {"content": "ok"})
-        yield KiroEvent(EventName.METERING, {"credits": 3.14})
+        yield KiroEvent(EventName.METERING, {"usage": 3.14})
         yield KiroEvent(EventName.METADATA, {
             "tokenUsage": {"inputTokens": 10, "outputTokens": 5,
-                           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                           "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}
         })
         yield KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "END_TURN"})
 
@@ -514,10 +514,10 @@ async def test_metering_event_updates_credits():
 async def test_context_usage_event_updates_percentage():
     async def _with_ctx():
         yield KiroEvent(EventName.ASSISTANT_RESPONSE, {"content": "ok"})
-        yield KiroEvent(EventName.CONTEXT_USAGE, {"contextWindowPercentage": 42.5})
+        yield KiroEvent(EventName.CONTEXT_USAGE, {"contextUsagePercentage": 42.5})
         yield KiroEvent(EventName.METADATA, {
             "tokenUsage": {"inputTokens": 10, "outputTokens": 5,
-                           "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+                           "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}
         })
         yield KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "END_TURN"})
 
@@ -597,7 +597,7 @@ async def test_thinking_then_tool_sequence():
         })
         yield KiroEvent(EventName.METADATA, {
             "tokenUsage": {"inputTokens": 30, "outputTokens": 10,
-                           "cacheReadInputTokens": 2, "cacheCreationInputTokens": 1}
+                           "cacheReadInputTokens": 2, "cacheWriteInputTokens": 1}
         })
         yield KiroEvent(EventName.MESSAGE_STOP, {"stopReason": "TOOL_USE"})
 

@@ -94,7 +94,8 @@ async def make_text_events(text_chunks: List[str], stop_reason: str = "END_TURN"
                 "inputTokens": 100,
                 "outputTokens": 50,
                 "cacheReadInputTokens": 10,
-                "cacheCreationInputTokens": 5,
+                "cacheWriteInputTokens": 5,
+                "totalTokens": 150,
             }
         },
     )
@@ -127,7 +128,8 @@ async def make_thinking_events(
                 "inputTokens": 200,
                 "outputTokens": 80,
                 "cacheReadInputTokens": 20,
-                "cacheCreationInputTokens": 15,
+                "cacheWriteInputTokens": 15,
+                "totalTokens": 280,
             }
         },
     )
@@ -147,7 +149,8 @@ async def make_tool_use_events(tool_id: str, tool_name: str, tool_input: dict):
                 "inputTokens": 150,
                 "outputTokens": 30,
                 "cacheReadInputTokens": 0,
-                "cacheCreationInputTokens": 0,
+                "cacheWriteInputTokens": 0,
+                "totalTokens": 180,
             }
         },
     )
