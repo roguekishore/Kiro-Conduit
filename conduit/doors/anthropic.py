@@ -61,6 +61,8 @@ from conduit.kiro.usage import (
 from conduit.seam.emit import emit
 from conduit.foundation.auth import resolve_profile_arn
 from conduit.foundation.http_client import KiroHttpClient
+from conduit.foundation.kiro_errors import enhance_kiro_error
+from conduit.foundation.model_resolver import normalize_model_name
 
 
 # ---------------------------------------------------------------------------
@@ -352,10 +354,26 @@ def _build_kiro_payload(
             for t in request_data.tools
         ]
 
+    # NORMALIZE before the id goes on the wire. Claude Code spells minor versions
+    # with a dash (`claude-sonnet-4-6`); Kiro accepts only the dotted form
+    # (`claude-sonnet-4.6`) and answers anything else with
+    #   400 {"reason":"INVALID_MODEL_ID"}
+    #
+    # This door used to hand `request_data.model` straight through, which is why
+    # only minor-version models failed: `claude-opus-5` has nothing to convert and
+    # worked, while `claude-sonnet-4-6`, `claude-haiku-4-5` and `claude-opus-4-8`
+    # were all rejected. The same models work on the upstream gateway precisely
+    # because it normalizes here and CONDUIT did not — so this was never a
+    # subscription-tier limit, which the error text below wrongly suggested.
+    #
+    # One conversion, at the single point where the Kiro payload is built:
+    # build_conversation_state() propagates model_id into every userInputMessage,
+    # the history entries, and the reasoning fields, so normalizing at the call
+    # site keeps all of them consistent.
     return build_conversation_state(
         messages=history_messages,
         system_prompt=system_prompt,
-        model_id=request_data.model,
+        model_id=normalize_model_name(request_data.model),
         tools=tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
@@ -522,11 +540,71 @@ async def messages(
         logger.warning(
             f"[anthropic] Kiro returned {kiro_response.status_code}: {err_text[:200]}"
         )
+
+        # Kiro's own message is frequently useless on its own. Measured: a
+        # request for claude-opus-4.8 came back
+        #   {"message":"Invalid model ID. Please select a different model to
+        #    continue.","reason":"INVALID_MODEL_ID"}
+        # while that exact id IS in FALLBACK_MODELS and normalizes cleanly
+        # (claude-opus-4-8 → claude-opus-4.8). So the rejection is Kiro's, not a
+        # mapping bug here — and per kiro_errors, INVALID_MODEL_ID means the name
+        # is unknown *or the account's subscription does not cover it*. Without
+        # that distinction the message sends you looking for a gateway bug that
+        # does not exist.
+        #
+        # enhance_kiro_error() and get_suggestions_for_model() both already
+        # existed for exactly this and were never wired to a caller. Wire them.
+        message = err_text
+        try:
+            error_json = json.loads(err_text)
+        except (json.JSONDecodeError, TypeError):
+            error_json = None
+        if isinstance(error_json, dict):
+            info = enhance_kiro_error(error_json)
+            message = info.user_message
+            if info.reason == "INVALID_MODEL_ID":
+                requested = request_data.model
+                normalized = normalize_model_name(requested)
+                message = (
+                    f"{info.user_message} Requested {requested!r} "
+                    f"(sent to Kiro as {normalized!r})."
+                )
+                # Same-family suggestions only: get_suggestions_for_model() never
+                # crosses families, so an Opus request is never answered with
+                # "try Haiku". The resolver hangs off the account and is Optional,
+                # so a missing one costs the suggestion list, not the response.
+                resolver = getattr(account, "model_resolver", None)
+                if resolver is not None:
+                    try:
+                        alternatives = [
+                            m
+                            for m in resolver.get_suggestions_for_model(requested)
+                            if m != normalized
+                        ]
+                    except Exception as exc:  # never let a hint break the error path
+                        logger.debug(f"[anthropic] model suggestions unavailable: {exc}")
+                        alternatives = []
+                    if alternatives:
+                        message += f" Available in this family: {', '.join(alternatives)}."
+                logger.warning(
+                    f"[anthropic] INVALID_MODEL_ID for {requested!r} "
+                    f"(sent to Kiro as {normalized!r}). Either Kiro does not know that id "
+                    f"or this account's plan does not cover it — check it against "
+                    f"GET /v1/models before suspecting the mapping."
+                )
+
         return JSONResponse(
             status_code=kiro_response.status_code,
             content={
                 "type": "error",
-                "error": {"type": "api_error", "message": err_text},
+                "error": {
+                    "type": "api_error",
+                    "message": message,
+                    # The raw upstream body stays available for debugging: the
+                    # enhanced message is for humans, not a replacement for
+                    # evidence.
+                    "upstream_message": err_text,
+                },
             },
         )
 
