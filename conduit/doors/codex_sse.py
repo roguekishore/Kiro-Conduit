@@ -59,6 +59,11 @@ from loguru import logger
 
 from conduit.contracts.events import EventName, KiroEvent, UnknownEvent, DispatchedEvent
 from conduit.contracts.metrics import StopReason, TurnMetrics
+from conduit.kiro.usage import (
+    apply_context_usage_event,
+    apply_metadata_event,
+    apply_metering_event,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +506,7 @@ async def translate_kiro_to_responses_sse(
     *,
     model: str,
     response_id: Optional[str] = None,
+    metrics: Optional[TurnMetrics] = None,
 ) -> AsyncGenerator[str, None]:
     """Translate a stream of Kiro dispatched events into Responses SSE frames.
 
@@ -516,6 +522,9 @@ async def translate_kiro_to_responses_sse(
         model:        The Kiro model id that was used for this turn.
         response_id:  Caller-supplied response id.  A fresh one is generated
                       when not provided.
+        metrics:      Optional TurnMetrics to populate IN-PLACE, so the caller
+                      can read real counts after iteration and hand them to the
+                      Lane F seam. A fresh one is used when not supplied.
 
     Yields:
         SSE-formatted strings, one per event frame.
@@ -523,8 +532,10 @@ async def translate_kiro_to_responses_sse(
     if response_id is None:
         response_id = _response_id()
 
-    # Per-stream state
-    metrics = TurnMetrics()
+    # Per-stream state. Reuse the caller's TurnMetrics when given so the door
+    # can read real counts after the stream ends (Lane C does the same).
+    if metrics is None:
+        metrics = TurnMetrics()
     output_index: int = 0        # current output item index
     text_item_id: Optional[str] = None
     text_item_open: bool = False
@@ -698,31 +709,28 @@ async def translate_kiro_to_responses_sse(
                 output_index += 1
 
             # ------------------------------------------------------------------
-            # Metering — captures credit usage (not token counts)
+            # Usage events — parsed by Lane A, never hand-rolled here.
+            #
+            # Lane A owns every wire field name. Hand-rolling them here is what
+            # made this translator report wrong numbers while exact counts were
+            # on the wire:
+            #   - it read `thinkingTokens`, which Kiro never sends (the field is
+            #     `thoughtTokens`), so reasoning_tokens was always 0;
+            #   - it SUMMED total_tokens instead of reading `totalTokens`, and
+            #     the sum omitted thought tokens entirely;
+            #   - it took cache counts off contextUsageEvent, but they arrive in
+            #     metadataEvent.tokenUsage (both spellings), so contextUsage's
+            #     real payload — contextUsagePercentage — was never read;
+            #   - it dropped meteringEvent credits on the floor.
             # ------------------------------------------------------------------
             elif name == EventName.METERING:
-                # Store raw metering data; token counts come from metadataEvent
-                pass
+                apply_metering_event(metrics, payload)
 
-            # ------------------------------------------------------------------
-            # Metadata — token counts
-            # ------------------------------------------------------------------
             elif name == EventName.METADATA:
-                usage_block = payload.get("tokenUsage", {})
-                if usage_block:
-                    metrics.input_tokens = usage_block.get("inputTokens", 0)
-                    metrics.output_tokens = usage_block.get("outputTokens", 0)
-                    metrics.thought_tokens = usage_block.get("thinkingTokens", 0)
-                    metrics.total_tokens = (
-                        metrics.input_tokens + metrics.output_tokens
-                    )
+                apply_metadata_event(metrics, payload)
 
-            # ------------------------------------------------------------------
-            # Context usage (cache fields)
-            # ------------------------------------------------------------------
             elif name == EventName.CONTEXT_USAGE:
-                metrics.cache_read_tokens = payload.get("cacheReadTokens", 0)
-                metrics.cache_write_tokens = payload.get("cacheWriteTokens", 0)
+                apply_context_usage_event(metrics, payload)
 
             # ------------------------------------------------------------------
             # Message stop — primary terminal event
