@@ -223,6 +223,14 @@ async def stream_to_anthropic_sse(
             # ------------------------------------------------------------------
             elif name == EventName.REASONING_CONTENT:
                 thinking_text = payload.get("content", "")
+                # Some Kiro revisions carry the reasoning text under "text"
+                # instead of "content". The codex door already tolerates both
+                # (codex_sse.py, same event); without the fallback here a turn
+                # whose payload uses "text" opened a thinking block and streamed
+                # nothing into it. "content" stays authoritative — every fixture
+                # and Lane A's own parser use it.
+                if not thinking_text:
+                    thinking_text = payload.get("text", "")
                 signature = payload.get("signature")  # may be None
 
                 # Open thinking block if first chunk

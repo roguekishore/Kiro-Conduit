@@ -115,6 +115,18 @@ def create_app() -> FastAPI:
     async def health() -> dict:
         return {"status": "ok", "version": __version__}
 
+    @app.get("/api/hello", tags=["meta"])
+    async def hello() -> dict:
+        """Reachability probe.
+
+        The Kiro CLI probes this path to decide whether a gateway is live.
+        Without it the request 404'd, and each failed probe still minted a
+        session downstream — filling SAGA with empty sessions that never
+        carried a turn. Same unauthenticated shape as /health, so it exposes
+        nothing that endpoint did not already.
+        """
+        return {"status": "ok", "version": __version__}
+
     @app.get("/v1/models", tags=["meta"])
     async def list_models() -> dict:
         """Model catalog.
