@@ -61,7 +61,12 @@ from conduit.config import PROFILE_ARN, PROXY_API_KEY
 from conduit.contracts.metrics import TurnMetrics
 from conduit.contracts.rewritten import RewrittenOut
 from conduit.contracts.seam import SeamEnvelope
-from conduit.doors.codex_dialect import LITE_HEADER, extract_dialect
+from conduit.doors.codex_dialect import (
+    FREEFORM_PARAM,
+    LITE_HEADER,
+    adapt_freeform_tools,
+    extract_dialect,
+)
 from conduit.doors.codex_sse import translate_kiro_to_responses_sse
 from conduit.foundation.auth import resolve_profile_arn
 from conduit.foundation.http_client import KiroHttpClient
@@ -288,7 +293,28 @@ def _to_history_messages(input_items: List[Dict[str, Any]]) -> List[HistoryMessa
             ))
             continue
 
-        if item_type == "function_call_output":
+        if item_type == "custom_tool_call":
+            # A freeform tool call from an earlier turn. It carries raw source
+            # text in ``input`` rather than a JSON ``arguments`` object, so it is
+            # re-wrapped under the same synthetic parameter the tool was
+            # declared with (see adapt_freeform_tools) — history must round-trip
+            # into the shape Kiro was told to expect.
+            raw_input = item.get("input")
+            if not isinstance(raw_input, str):
+                raw_input = "" if raw_input is None else str(raw_input)
+
+            out.append(HistoryMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{
+                    "toolUseId": item.get("call_id") or item.get("id") or "",
+                    "name": item.get("name", ""),
+                    "input": {FREEFORM_PARAM: raw_input},
+                }],
+            ))
+            continue
+
+        if item_type in ("function_call_output", "custom_tool_call_output"):
             # Codex's FunctionCallOutput carries NO item-level success/error
             # flag (verified in Codex source), so a truthful status cannot be
             # read off this wire. Lane B's documented fallback is
@@ -407,8 +433,16 @@ async def post_responses(
         is_lite=is_lite,
     )
 
+    # Freeform ("custom") tools cannot be expressed in a Kiro toolSpecification,
+    # which only carries a JSON Schema. Rewrite each into a function with one
+    # string parameter and remember which names they were, so replies get framed
+    # back as custom_tool_call. Without this, Codex's `exec` reached Kiro with an
+    # empty inputSchema and every call was discarded as unsupported.
+    tools, custom_names = adapt_freeform_tools(tools)
+
     logger.debug(
-        f"codex door: prompt_len={len(system_prompt)} tools={len(tools)}"
+        f"codex door: prompt_len={len(system_prompt)} tools={len(tools)} "
+        f"freeform={sorted(custom_names)}"
     )
 
     # --- Ids for the whole turn ---
@@ -508,6 +542,7 @@ async def post_responses(
                 model=body.model,
                 response_id=response_id,
                 metrics=metrics,
+                custom_tool_names=custom_names,
             ):
                 yield frame.encode("utf-8")
         except GeneratorExit:

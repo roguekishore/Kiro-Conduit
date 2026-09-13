@@ -59,6 +59,7 @@ from loguru import logger
 
 from conduit.contracts.events import EventName, KiroEvent, UnknownEvent, DispatchedEvent
 from conduit.contracts.metrics import StopReason, TurnMetrics
+from conduit.doors.codex_dialect import freeform_input_from_arguments
 from conduit.kiro.usage import (
     apply_context_usage_event,
     apply_metadata_event,
@@ -395,6 +396,53 @@ def frame_function_call_arguments_done(
 
 
 # ---------------------------------------------------------------------------
+# Freeform ("custom") tool-call frames
+#
+# A freeform tool takes raw source text, not a JSON arguments object, and it
+# travels on its own event names and its own output-item type. Codex's handler
+# accepts a freeform tool's result only via ToolPayload::Custom, so framing one
+# of these as function_call/arguments makes Codex discard the call as
+# unsupported — and on the next request it back-fills the missing result with
+# the literal string "aborted".
+# ---------------------------------------------------------------------------
+
+def frame_custom_tool_call_input_delta(
+    response_id: str,
+    item_id: str,
+    output_index: int,
+    call_id: str,
+    delta: str,
+) -> str:
+    payload: Dict[str, Any] = {
+        "type": "response.custom_tool_call_input.delta",
+        "response_id": response_id,
+        "item_id": item_id,
+        "output_index": output_index,
+        "call_id": call_id,
+        "delta": delta,
+    }
+    return _sse("response.custom_tool_call_input.delta", payload)
+
+
+def frame_custom_tool_call_input_done(
+    response_id: str,
+    item_id: str,
+    output_index: int,
+    call_id: str,
+    input_text: str,
+) -> str:
+    payload: Dict[str, Any] = {
+        "type": "response.custom_tool_call_input.done",
+        "response_id": response_id,
+        "item_id": item_id,
+        "output_index": output_index,
+        "call_id": call_id,
+        "input": input_text,
+    }
+    return _sse("response.custom_tool_call_input.done", payload)
+
+
+# ---------------------------------------------------------------------------
 # Terminal frames
 # ---------------------------------------------------------------------------
 
@@ -507,6 +555,7 @@ async def translate_kiro_to_responses_sse(
     model: str,
     response_id: Optional[str] = None,
     metrics: Optional[TurnMetrics] = None,
+    custom_tool_names: Optional[set] = None,
 ) -> AsyncGenerator[str, None]:
     """Translate a stream of Kiro dispatched events into Responses SSE frames.
 
@@ -525,6 +574,12 @@ async def translate_kiro_to_responses_sse(
         metrics:      Optional TurnMetrics to populate IN-PLACE, so the caller
                       can read real counts after iteration and hand them to the
                       Lane F seam. A fresh one is used when not supplied.
+        custom_tool_names:
+                      Names of tools the client declared as freeform
+                      ("custom"), from adapt_freeform_tools(). Calls to these
+                      are framed as ``custom_tool_call`` carrying raw source
+                      text; Codex accepts a freeform tool's result only via
+                      ToolPayload::Custom and discards a function_call framing.
 
     Yields:
         SSE-formatted strings, one per event frame.
@@ -550,6 +605,7 @@ async def translate_kiro_to_responses_sse(
     tool_call_id: Optional[str] = None
     accumulated_args: str = ""
     tool_output_index: int = -1
+    _custom_names: set = custom_tool_names or set()
 
     completed_items: List[Dict[str, Any]] = []
     stream_terminated: bool = False
@@ -673,40 +729,104 @@ async def translate_kiro_to_responses_sse(
                 tool_output_index = output_index
                 accumulated_args = tool_input
 
-                yield frame_output_item_added(
-                    response_id,
-                    tool_item_id,
-                    "function_call",
-                    tool_output_index,
-                    {"name": tool_name, "call_id": tool_call_id},
-                )
-                yield frame_function_call_arguments_delta(
-                    response_id, tool_item_id, tool_output_index, tool_call_id, tool_input
-                )
-                yield frame_function_call_arguments_done(
-                    response_id,
-                    tool_item_id,
-                    tool_output_index,
-                    tool_call_id,
-                    tool_input,
-                )
-                completed_items.append(
-                    {
-                        "id": tool_item_id,
-                        "type": "function_call",
-                        "call_id": tool_call_id,
-                        "name": tool_name,
-                        "arguments": tool_input,
-                    }
-                )
-                yield frame_output_item_done(
-                    response_id,
-                    tool_item_id,
-                    "function_call",
-                    tool_output_index,
-                    {"name": tool_name, "call_id": tool_call_id, "arguments": tool_input},
-                )
-                output_index += 1
+                if tool_name in _custom_names:
+                    # Freeform tool. Kiro replies with a JSON arguments object
+                    # because that is how the tool had to be declared to it, so
+                    # the raw source is recovered before framing. Everything
+                    # here — item type and event names — is the custom variant;
+                    # Codex's handler matches only ToolPayload::Custom.
+                    source = freeform_input_from_arguments(tool_input)
+                    logger.debug(
+                        "codex_sse: freeform tool {} framed as custom_tool_call, "
+                        "source_len={}",
+                        tool_name,
+                        len(source),
+                    )
+                    yield frame_output_item_added(
+                        response_id,
+                        tool_item_id,
+                        "custom_tool_call",
+                        tool_output_index,
+                        {"name": tool_name, "call_id": tool_call_id},
+                    )
+                    yield frame_custom_tool_call_input_delta(
+                        response_id,
+                        tool_item_id,
+                        tool_output_index,
+                        tool_call_id,
+                        source,
+                    )
+                    yield frame_custom_tool_call_input_done(
+                        response_id,
+                        tool_item_id,
+                        tool_output_index,
+                        tool_call_id,
+                        source,
+                    )
+                    completed_items.append(
+                        {
+                            "id": tool_item_id,
+                            "type": "custom_tool_call",
+                            "call_id": tool_call_id,
+                            "name": tool_name,
+                            "input": source,
+                        }
+                    )
+                    yield frame_output_item_done(
+                        response_id,
+                        tool_item_id,
+                        "custom_tool_call",
+                        tool_output_index,
+                        {
+                            "name": tool_name,
+                            "call_id": tool_call_id,
+                            "input": source,
+                        },
+                    )
+                    output_index += 1
+                else:
+                    yield frame_output_item_added(
+                        response_id,
+                        tool_item_id,
+                        "function_call",
+                        tool_output_index,
+                        {"name": tool_name, "call_id": tool_call_id},
+                    )
+                    yield frame_function_call_arguments_delta(
+                        response_id,
+                        tool_item_id,
+                        tool_output_index,
+                        tool_call_id,
+                        tool_input,
+                    )
+                    yield frame_function_call_arguments_done(
+                        response_id,
+                        tool_item_id,
+                        tool_output_index,
+                        tool_call_id,
+                        tool_input,
+                    )
+                    completed_items.append(
+                        {
+                            "id": tool_item_id,
+                            "type": "function_call",
+                            "call_id": tool_call_id,
+                            "name": tool_name,
+                            "arguments": tool_input,
+                        }
+                    )
+                    yield frame_output_item_done(
+                        response_id,
+                        tool_item_id,
+                        "function_call",
+                        tool_output_index,
+                        {
+                            "name": tool_name,
+                            "call_id": tool_call_id,
+                            "arguments": tool_input,
+                        },
+                    )
+                    output_index += 1
 
             # ------------------------------------------------------------------
             # Usage events — parsed by Lane A, never hand-rolled here.
