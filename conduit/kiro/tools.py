@@ -44,11 +44,15 @@ from loguru import logger
 
 def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Remove fields from a JSON Schema that the Kiro API rejects.
+    Remove fields from a JSON Schema that the Kiro API rejects, and ensure
+    Bedrock-compatible structure.
 
-    Kiro returns ``400 "Improperly formed request"`` when:
+    Kiro / Bedrock returns ``400`` when:
     - ``required`` is an empty list ``[]``
     - ``additionalProperties`` is present anywhere in the schema
+    - The top-level ``type`` field is missing or is not ``"object"``
+      (Bedrock: ``"The value at toolConfig.tools.0.toolSpec.inputSchema.json.type
+      must be one of the following: object"``)
 
     The function recurses into ``properties``, plain object values, and list
     items (e.g. ``anyOf`` / ``oneOf``).
@@ -60,7 +64,7 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         A sanitized copy (original is not mutated).
     """
     if not schema:
-        return {}
+        return {"type": "object"}
 
     result: Dict[str, Any] = {}
     for key, value in schema.items():
@@ -82,6 +86,12 @@ def sanitize_json_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             ]
         else:
             result[key] = value
+
+    # Bedrock requires the top-level type to be "object".  When it is absent or
+    # set to something else (e.g. the WebSearch tool schema that has no "type"
+    # at all), inject "object" so the payload is accepted.
+    if result.get("type") != "object":
+        result["type"] = "object"
 
     return result
 
@@ -160,6 +170,7 @@ def build_tool_result(
     tool_use_id: str,
     content: Any,
     is_error: bool = False,
+    images: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Build a single Kiro tool-result dict.
@@ -183,6 +194,9 @@ def build_tool_result(
         tool_use_id: The ``tool_use_id`` / ``toolUseId`` from the tool call.
         content:     Tool output; any type accepted.
         is_error:    Whether the tool call resulted in an error.
+        images:      Optional list of Kiro-format image dicts
+                     ``{"format": str, "source": {"bytes": str}}`` to append
+                     to the content array (e.g. screenshots from computer-use).
 
     Returns:
         Kiro wire-format tool result dict.
@@ -200,8 +214,12 @@ def build_tool_result(
 
     status = "error" if is_error else "success"
 
+    content_array: List[Dict[str, Any]] = [{"text": text}]
+    if images:
+        content_array.extend(images)
+
     return {
-        "content": [{"text": text}],
+        "content": content_array,
         "status": status,
         "toolUseId": tool_use_id,
     }
@@ -243,8 +261,10 @@ def build_tool_results_from_anthropic(
         if block_type != "tool_result" or not tool_use_id:
             continue
 
-        # Flatten list content to text
+        # Extract images from list content before flattening text
+        result_images: Optional[List[Dict[str, Any]]] = None
         if isinstance(raw_content, list):
+            result_images = _extract_images_from_list(raw_content) or None
             raw_content = _extract_text_from_list(raw_content)
         elif not isinstance(raw_content, str):
             raw_content = str(raw_content) if raw_content is not None else ""
@@ -254,6 +274,7 @@ def build_tool_results_from_anthropic(
                 tool_use_id=tool_use_id,
                 content=raw_content,
                 is_error=is_error,
+                images=result_images,
             )
         )
 
@@ -278,3 +299,64 @@ def _extract_text_from_list(blocks: List[Any]) -> str:
         elif isinstance(item, str):
             parts.append(item)
     return "".join(parts)
+
+
+def _extract_images_from_list(blocks: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Extract base64 image blocks from a list of Anthropic content blocks and
+    convert them to Kiro wire format.
+
+    Anthropic image shape:
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}}
+
+    Kiro image shape:
+        {"format": "jpeg", "source": {"bytes": "..."}}
+
+    URL-based images (``source.type == "url"``) are logged as warnings and
+    skipped — Kiro has no fetch capability.
+
+    Args:
+        blocks: List of Anthropic content block dicts.
+
+    Returns:
+        List of Kiro-format image dicts; empty if no images found.
+    """
+    kiro_images: List[Dict[str, Any]] = []
+    for item in blocks:
+        if isinstance(item, dict):
+            item_type = item.get("type")
+        elif hasattr(item, "type"):
+            item_type = item.type
+        else:
+            continue
+
+        if item_type != "image":
+            continue
+
+        source = item.get("source", {}) if isinstance(item, dict) else getattr(item, "source", {})
+        if isinstance(source, dict):
+            src_type = source.get("type")
+            if src_type == "base64":
+                media_type = source.get("media_type", "image/jpeg")
+                data = source.get("data", "")
+                if data:
+                    fmt = media_type.split("/")[-1] if "/" in media_type else media_type
+                    kiro_images.append({"format": fmt, "source": {"bytes": data}})
+            elif src_type == "url":
+                logger.warning(
+                    f"URL-based image in tool_result cannot be forwarded to Kiro "
+                    f"(Kiro has no fetch capability): {source.get('url', '')[:120]!r}"
+                )
+        elif hasattr(source, "type"):
+            if source.type == "base64":
+                media_type = getattr(source, "media_type", "image/jpeg")
+                data = getattr(source, "data", "")
+                if data:
+                    fmt = media_type.split("/")[-1] if "/" in media_type else media_type
+                    kiro_images.append({"format": fmt, "source": {"bytes": data}})
+            elif source.type == "url":
+                logger.warning(
+                    f"URL-based image in tool_result cannot be forwarded to Kiro "
+                    f"(Kiro has no fetch capability): {getattr(source, 'url', '')[:120]!r}"
+                )
+    return kiro_images

@@ -43,6 +43,7 @@ from loguru import logger
 from conduit.config import (
     PROFILE_ARN,
     PROXY_API_KEY,
+    WEB_SEARCH_ENABLED,
 )
 from conduit.contracts.events import DispatchedEvent, EventName, KiroEvent, UnknownEvent
 from conduit.contracts.metrics import ReasoningBlockMeta, TurnMetrics
@@ -53,6 +54,7 @@ from conduit.kiro.dispatch import iter_events
 from conduit.kiro.history import HistoryMessage
 from conduit.kiro.request import build_conversation_state
 from conduit.kiro.tools import build_tool_results_from_anthropic
+from conduit.kiro.derive import derive_token_accounting
 from conduit.kiro.usage import (
     apply_context_usage_event,
     apply_metadata_event,
@@ -487,6 +489,139 @@ async def messages(
         )
 
     # ------------------------------------------------------------------
+    # Web Search — Path A: native Anthropic server-side tool (early return)
+    # Detect tools with type starting with "web_search" and route directly
+    # to the MCP API, bypassing /generateAssistantResponse entirely.
+    # This path fires regardless of WEB_SEARCH_ENABLED.
+    # ------------------------------------------------------------------
+    if request_data.tools:
+        for tool in request_data.tools:
+            tool_type = getattr(tool, "type", None) or (
+                tool.get("type") if isinstance(tool, dict) else None
+            )
+            if tool_type and str(tool_type).startswith("web_search"):
+                from conduit.kiro.mcp import (
+                    call_mcp_web_search,
+                    anthropic_web_search_sse,
+                    anthropic_web_search_json,
+                )
+                # Extract query from the first user message
+                query: Optional[str] = None
+                for msg in request_data.messages:
+                    if msg.role == "user":
+                        content = msg.content
+                        if isinstance(content, str):
+                            query = content.strip()
+                        elif isinstance(content, list):
+                            parts = []
+                            for blk in content:
+                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                    parts.append(blk.get("text", ""))
+                                elif hasattr(blk, "type") and blk.type == "text":
+                                    parts.append(getattr(blk, "text", ""))
+                            query = "".join(parts).strip()
+                        break
+
+                if not query:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "type": "error",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": "Cannot extract search query from messages",
+                            },
+                        },
+                    )
+
+                logger.info(f"[anthropic] web_search Path A — query: {query!r}")
+                ws_tool_use_id, ws_results = await call_mcp_web_search(
+                    query, auth_manager
+                )
+
+                if ws_results is None:
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": "Web search failed. Please try again.",
+                            },
+                        },
+                    )
+
+                if request_data.stream:
+                    async def _ws_stream_a() -> AsyncGenerator[str, None]:
+                        async for chunk in anthropic_web_search_sse(
+                            request_data.model,
+                            query,
+                            ws_tool_use_id,
+                            ws_results,
+                            message_id,
+                        ):
+                            yield chunk
+
+                    return StreamingResponse(
+                        _ws_stream_a(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                else:
+                    return JSONResponse(
+                        content=anthropic_web_search_json(
+                            request_data.model,
+                            query,
+                            ws_tool_use_id,
+                            ws_results,
+                            message_id,
+                        )
+                    )
+
+    # ------------------------------------------------------------------
+    # Web Search — Path B: auto-inject web_search tool (MCP emulation)
+    # The model decides whether to call it; the streaming wrapper intercepts
+    # the tool-use block and replaces it with the MCP result.
+    # ------------------------------------------------------------------
+    if WEB_SEARCH_ENABLED:
+        existing_names = set()
+        if request_data.tools:
+            for t in request_data.tools:
+                n = getattr(t, "name", None) or (
+                    t.get("name") if isinstance(t, dict) else None
+                )
+                if n:
+                    existing_names.add(n)
+
+        if "web_search" not in existing_names:
+            ws_tool = _Tool(
+                name="web_search",
+                description=(
+                    "Search the web for current information. "
+                    "Use when you need up-to-date data from the internet."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            )
+            if request_data.tools is None:
+                request_data.tools = [ws_tool]
+            else:
+                request_data.tools = list(request_data.tools) + [ws_tool]
+            logger.debug("[anthropic] auto-injected web_search tool (Path B)")
+
+    # ------------------------------------------------------------------
     # Build Kiro payload (Lane B or stub)
     # ------------------------------------------------------------------
     conversation_id = str(uuid.uuid4())
@@ -625,6 +760,14 @@ async def messages(
             streaming_error: Optional[Exception] = None
             client_disconnected = False
 
+            # Path B streaming intercept: buffer SSE chunks to detect a
+            # web_search tool_use block, then substitute MCP results for it.
+            # We parse the already-formatted SSE text back to check for
+            # tool_use blocks whose name is "web_search".
+            _ws_intercepting = False  # True once we see a web_search tool_use start
+            _ws_tool_idx: Optional[int] = None  # SSE block index being intercepted
+            _ws_query_buf: list = []             # accumulate input_json_delta fragments
+
             try:
                 async for chunk in stream_to_anthropic_sse(
                     events=_iter_kiro_events(kiro_response),
@@ -632,7 +775,140 @@ async def messages(
                     message_id=message_id,
                     metrics=metrics,
                 ):
-                    yield chunk
+                    # --- Path B intercept ---
+                    # We look for content_block_start with type==tool_use and
+                    # name==web_search, then absorb its deltas / stop, call the
+                    # MCP API, and emit the synthetic server-side response frames.
+                    if "\ndata: " in chunk:
+                        # Extract JSON payload from SSE frame
+                        for line in chunk.split("\n"):
+                            if not line.startswith("data: "):
+                                continue
+                            try:
+                                evt_data = json.loads(line[6:])
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+
+                            evt_type = evt_data.get("type")
+
+                            if evt_type == "content_block_start":
+                                blk = evt_data.get("content_block", {})
+                                if (
+                                    blk.get("type") == "tool_use"
+                                    and blk.get("name") == "web_search"
+                                ):
+                                    _ws_intercepting = True
+                                    _ws_tool_idx = evt_data.get("index")
+                                    _ws_query_buf = []
+                                    # Suppress: don't yield this frame
+                                    break
+
+                            if _ws_intercepting:
+                                if evt_type == "content_block_delta":
+                                    delta = evt_data.get("delta", {})
+                                    if delta.get("type") == "input_json_delta":
+                                        _ws_query_buf.append(
+                                            delta.get("partial_json", "")
+                                        )
+                                    break  # suppress
+
+                                if evt_type == "content_block_stop":
+                                    if evt_data.get("index") == _ws_tool_idx:
+                                        # We have all fragments — call MCP API
+                                        _ws_intercepting = False
+                                        try:
+                                            raw = "".join(_ws_query_buf).strip() or "{}"
+                                            ws_args = json.loads(raw)
+                                            ws_query = ws_args.get("query", "")
+                                        except (json.JSONDecodeError, AttributeError):
+                                            ws_query = ""
+
+                                        if ws_query:
+                                            logger.info(
+                                                f"[anthropic] web_search Path B — "
+                                                f"query: {ws_query!r}"
+                                            )
+                                            from conduit.kiro.mcp import (
+                                                call_mcp_web_search,
+                                                build_search_summary,
+                                            )
+                                            ws_tid, ws_res = await call_mcp_web_search(
+                                                ws_query, auth_manager
+                                            )
+                                            if ws_res is not None:
+                                                from conduit.kiro.mcp import (
+                                                    anthropic_web_search_sse,
+                                                )
+
+                                                def _sse(et: str, d: dict) -> str:
+                                                    return (
+                                                        f"event: {et}\n"
+                                                        f"data: {json.dumps(d, ensure_ascii=False)}\n\n"
+                                                    )
+
+                                                idx = _ws_tool_idx or 0
+                                                # server_tool_use
+                                                yield _sse("content_block_start", {
+                                                    "type": "content_block_start",
+                                                    "index": idx,
+                                                    "content_block": {
+                                                        "id": ws_tid,
+                                                        "type": "server_tool_use",
+                                                        "name": "web_search",
+                                                        "input": {},
+                                                    },
+                                                })
+                                                yield _sse("content_block_delta", {
+                                                    "type": "content_block_delta",
+                                                    "index": idx,
+                                                    "delta": {
+                                                        "type": "input_json_delta",
+                                                        "partial_json": json.dumps(
+                                                            {"query": ws_query}
+                                                        ),
+                                                    },
+                                                })
+                                                yield _sse("content_block_stop", {
+                                                    "type": "content_block_stop",
+                                                    "index": idx,
+                                                })
+                                                # web_search_tool_result
+                                                sc = [
+                                                    {
+                                                        "type": "web_search_result",
+                                                        "title": r.get("title", ""),
+                                                        "url": r.get("url", ""),
+                                                        "encrypted_content": r.get(
+                                                            "snippet", ""
+                                                        ),
+                                                        "page_age": None,
+                                                    }
+                                                    for r in ws_res.get("results", [])
+                                                ]
+                                                yield _sse("content_block_start", {
+                                                    "type": "content_block_start",
+                                                    "index": idx + 1,
+                                                    "content_block": {
+                                                        "type": "web_search_tool_result",
+                                                        "tool_use_id": ws_tid,
+                                                        "content": sc,
+                                                    },
+                                                })
+                                                yield _sse("content_block_stop", {
+                                                    "type": "content_block_stop",
+                                                    "index": idx + 1,
+                                                })
+                                        break  # suppress original stop frame
+                                break  # suppress all other frames while intercepting
+                        else:
+                            # No web_search interception — pass through unchanged
+                            if not _ws_intercepting:
+                                yield chunk
+                        # If we parsed a break above and didn't yield, don't fall through
+                        continue
+                    # Not an SSE data frame (e.g. blank line) — pass through
+                    if not _ws_intercepting:
+                        yield chunk
 
             except GeneratorExit:
                 client_disconnected = True
@@ -685,6 +961,12 @@ async def messages(
     thinking_sig_buf  = ""
     text_buf          = ""
     tool_blocks_out: List[Dict[str, Any]] = []
+    output_chars      = 0
+
+    # Tool fragment state: one entry per in-flight tool call, keyed by toolUseId.
+    # Kiro sends opener (name, empty input) + N fragment frames (input string) +
+    # closer (stop: true). We accumulate and emit one complete block per call.
+    _tool_pending: Dict[str, Dict[str, Any]] = {}
 
     # Track block structure
     _curr_thinking = False
@@ -716,15 +998,36 @@ async def messages(
                 _blk.signature_present = True
 
         elif name == EventName.ASSISTANT_RESPONSE:
-            text_buf += payload.get("content", "")
+            chunk = payload.get("content", "")
+            text_buf += chunk
+            output_chars += len(chunk)
 
         elif name == EventName.TOOL_USE:
-            tool_blocks_out.append({
-                "type": "tool_use",
-                "id": payload.get("toolUseId") or f"toolu_{uuid.uuid4().hex[:24]}",
-                "name": payload.get("name", ""),
-                "input": payload.get("input", {}),
-            })
+            tid = payload.get("toolUseId") or f"toolu_{uuid.uuid4().hex[:24]}"
+            if tid not in _tool_pending:
+                # Opener frame: name present, input empty/absent.
+                _tool_pending[tid] = {
+                    "id": tid,
+                    "name": payload.get("name", ""),
+                    "fragments": [],
+                }
+            raw_input = payload.get("input", "")
+            if isinstance(raw_input, str):
+                _tool_pending[tid]["fragments"].append(raw_input)
+            if payload.get("stop"):
+                entry = _tool_pending.pop(tid)
+                partial = "".join(entry["fragments"]).strip() or "{}"
+                output_chars += len(partial)
+                try:
+                    parsed = json.loads(partial)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = {"_raw": partial}
+                tool_blocks_out.append({
+                    "type": "tool_use",
+                    "id": entry["id"],
+                    "name": entry["name"],
+                    "input": parsed,
+                })
 
         # Metrics are parsed by Lane A, never hand-rolled here. Lane A owns
         # every wire field name — including thoughtTokens and BOTH cache-field
@@ -734,7 +1037,8 @@ async def messages(
         # the wire: it read cacheCreationInputTokens (an Anthropic name, not
         # Kiro's), took credits from the wrong key, and never read
         # thoughtTokens at all.
-        elif name == EventName.METADATA:
+        elif name in (EventName.METADATA, EventName.MESSAGE_METADATA):
+            # Both wire spellings carry tokenUsage; see the streaming path.
             apply_metadata_event(metrics, payload)
 
         elif name == EventName.METERING:
@@ -764,14 +1068,19 @@ async def messages(
         content_blocks.append({"type": "text", "text": text_buf})
     content_blocks.extend(tool_blocks_out)
 
-    # Determine stop_reason
-    if tool_blocks_out:
+    # Determine stop_reason — mirror streaming path logic in anthropic_sse.py:386.
+    # CONTENT_FILTERED and other non-TOOL_USE stops must not be clobbered.
+    from conduit.contracts.metrics import StopReason as _SR
+    from conduit.doors.anthropic_sse import _map_stop_reason
+    if tool_blocks_out and metrics.stop_reason in (_SR.TOOL_USE, None):
         stop_reason = "tool_use"
-    elif metrics.stop_reason:
-        from conduit.doors.anthropic_sse import _map_stop_reason
+    elif metrics.stop_reason is not None:
         stop_reason = _map_stop_reason(metrics.stop_reason.value)
     else:
-        stop_reason = "end_turn"
+        stop_reason = "tool_use" if tool_blocks_out else "end_turn"
+
+    # Derive token accounting when upstream reported none (same logic as SSE path).
+    derive_token_accounting(metrics, request_data.model, output_chars)
 
     # Seam emit
     _fire_seam_emit(SeamEnvelope(
