@@ -52,6 +52,7 @@ from conduit.contracts.seam import SeamEnvelope
 from conduit.doors.anthropic_sse import stream_to_anthropic_sse
 from conduit.kiro.dispatch import iter_events
 from conduit.kiro.history import HistoryMessage
+from conduit.kiro.mcp import render_replayed_search
 from conduit.kiro.request import build_conversation_state
 from conduit.kiro.tools import build_tool_results_from_anthropic
 from conduit.kiro.derive import derive_token_accounting
@@ -143,6 +144,9 @@ class AnthropicMessagesRequest(BaseModel):
     system: Optional[Union[str, List[Any]]] = None
     stream: bool = False
     thinking: Optional[Dict[str, Any]] = None
+    # Claude Code's actual reasoning knob. Declared rather than left to
+    # `extra: allow` because the door reads it — see _effort_from_request.
+    output_config: Optional[Dict[str, Any]] = None
     tools: Optional[List[_Tool]] = None
     tool_choice: Optional[Any] = None
     temperature: Optional[float] = None
@@ -225,21 +229,48 @@ def _blocks_of(content: Union[str, List[Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _effort_from_thinking(thinking: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Map Anthropic's thinking budget onto Kiro's effort enum.
+def _effort_from_request(
+    thinking: Optional[Dict[str, Any]],
+    output_config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Recover the client's requested reasoning effort as Kiro's effort enum.
 
-    Anthropic expresses reasoning as a TOKEN BUDGET; Kiro takes an EFFORT ENUM
-    (low/medium/high/xhigh/max). There is no lossless mapping between them, so
-    this is an explicit, documented heuristic — not a protocol fact.
+    Two sources, in priority order.
 
-    Note the direction: upstream's defect was the reverse (converting an effort
-    request into an Anthropic-style budget to send to Kiro, which takes no
-    budget). Here the budget is what the harness sent us and the enum is what
-    the wire needs.
+    **1. ``output_config.effort`` — the real one.** Claude Code sends its session
+    effort here, and it is a pass-through, not a translation: the field name is
+    the same on both sides and the enum is the same five strings
+    (low/medium/high/xhigh/max). Measured over the captured corpus (695
+    `claude-code` requests): 334 carried ``output_config: {"effort": "high"}``,
+    always paired with ``thinking: {"type": "adaptive"}``.
 
-    Returns None when thinking is absent or disabled, letting Lane B apply its
-    own default.
+    **2. ``thinking.budget_tokens`` — a fallback for other clients.** An
+    Anthropic-shaped caller may express reasoning as a token budget instead.
+    There is no lossless mapping from a budget to an enum, so the thresholds
+    below are an explicit heuristic, not a protocol fact. Claude Code never
+    sends this: ``budget_tokens`` appears **zero** times in the corpus, which is
+    why relying on it alone sent no effort at all on 334 of 448 main requests.
+
+    ``thinking.type == "disabled"`` short-circuits to None deliberately. Those
+    are Claude Code's auto-mode permission classifier calls (365 in the corpus,
+    a ~122k-character prompt returning a one-token verdict, run *before* each
+    gated tool call). Handing them an effort level would make every tool call
+    slower for no benefit. Note that 18 of them do carry an ``output_config`` —
+    a ``format``/``json_schema`` block, not an effort — so reading the key
+    specifically, rather than testing for the object, matters.
+
+    Returns None when no effort was requested, letting Lane B decide.
     """
+    if thinking and thinking.get("type") == "disabled":
+        return None
+
+    if isinstance(output_config, dict):
+        effort = output_config.get("effort")
+        # Validation is reasoning.py's job (normalize_effort); the door only
+        # decides whether a value was requested at all.
+        if isinstance(effort, str) and effort.strip():
+            return effort.strip().lower()
+
     if not thinking:
         return None
     if thinking.get("type") not in ("enabled", "adaptive", None):
@@ -314,6 +345,24 @@ def _to_history_messages(
                         "remote images); the model is not shown this image"
                     )
 
+            # Server-side web search, replayed by the client on a later
+            # request. Kiro has no slot for either block type, so before this
+            # they fell through every branch and vanished: the model saw an
+            # assistant turn that searched for nothing and found nothing, and
+            # any follow-up question about the results was answered blind.
+            # Rendered into text, they survive the round trip.
+            elif btype == "server_tool_use":
+                if blk.get("name") == "web_search":
+                    args = blk.get("input") or {}
+                    query = str(args.get("query", "")) if isinstance(args, dict) else ""
+                    if query:
+                        text_parts.append(f'\n[web search: "{query}"]\n')
+
+            elif btype == "web_search_tool_result":
+                rendered = render_replayed_search(blk.get("content"))
+                if rendered:
+                    text_parts.append(rendered)
+
             # tool_result blocks are handled below, via Lane B's converter.
             # thinking / redacted_thinking are dropped: no Kiro slot, and the
             # signature is a provider-specific blob that must not be relayed.
@@ -379,8 +428,278 @@ def _build_kiro_payload(
         tools=tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        reasoning_effort=_effort_from_thinking(request_data.thinking),
+        reasoning_effort=_effort_from_request(
+            request_data.thinking, request_data.output_config
+        ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Web search continuation (Paths A and B)
+# ---------------------------------------------------------------------------
+
+def _strip_web_search_tools(request_data: AnthropicMessagesRequest) -> None:
+    """Remove web_search tool definitions from a request, in place.
+
+    Called before a continuation call. The search has already run; leaving the
+    tool advertised invites the model to call it again on a code path with no
+    interceptor, producing a tool_use nothing answers and a stalled turn.
+    """
+    if not request_data.tools:
+        return
+    kept = []
+    for t in request_data.tools:
+        name = getattr(t, "name", None) or (
+            t.get("name") if isinstance(t, dict) else None
+        )
+        ttype = getattr(t, "type", None) or (
+            t.get("type") if isinstance(t, dict) else None
+        )
+        if name == "web_search" or (ttype and str(ttype).startswith("web_search")):
+            continue
+        kept.append(t)
+    request_data.tools = kept or None
+
+
+def _search_block_frames(
+    index: int,
+    tool_use_id: str,
+    query: str,
+    results: Dict[str, Any],
+) -> List[str]:
+    """Build the SSE frames for one server-side search.
+
+    Emits ``server_tool_use`` at ``index`` and ``web_search_tool_result`` at
+    ``index + 1`` - the shape Anthropic clients render as a citation.
+    """
+    search_content = [
+        {
+            "type": "web_search_result",
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "encrypted_content": r.get("snippet", ""),
+            "page_age": None,
+        }
+        for r in results.get("results", [])
+    ]
+    return [
+        _sse_frame("content_block_start", {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {
+                "id": tool_use_id,
+                "type": "server_tool_use",
+                "name": "web_search",
+                "input": {},
+            },
+        }),
+        _sse_frame("content_block_delta", {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps({"query": query}),
+            },
+        }),
+        _sse_frame("content_block_stop", {
+            "type": "content_block_stop",
+            "index": index,
+        }),
+        _sse_frame("content_block_start", {
+            "type": "content_block_start",
+            "index": index + 1,
+            "content_block": {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": search_content,
+            },
+        }),
+        _sse_frame("content_block_stop", {
+            "type": "content_block_stop",
+            "index": index + 1,
+        }),
+    ]
+
+
+
+def _sse_frame(event_type: str, data: dict) -> str:
+    """Format one Anthropic SSE frame."""
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _augment_messages_for_search(
+    request_data: AnthropicMessagesRequest,
+    query: str,
+    summary: str,
+    tool_id: Optional[str] = None,
+) -> None:
+    """Fold a completed web search into ``request_data.messages``, in place.
+
+    This is what makes search actually inform the answer. Before this existed,
+    both search paths returned the raw results and stopped, so the model never
+    saw them: the turn ended with results on screen and no answer, and the
+    client had nothing to continue from.
+
+    Two shapes, because the two paths differ in what the model asked for:
+
+    - ``tool_id`` given (Path B): the model itself called the injected
+      ``web_search`` tool, so the results go back the native way — an assistant
+      turn carrying the ``tool_use`` followed by a user turn carrying the
+      matching ``tool_result``. Kiro has real slots for both.
+    - ``tool_id`` omitted (Path A): the client asked for Anthropic's
+      server-side tool, so there is no client tool call to answer. The summary
+      is appended to the last user turn as text instead, which keeps the
+      user/assistant alternation Kiro requires.
+
+    Args:
+        request_data: The request being rewritten; mutated in place.
+        query:        The executed search query.
+        summary:      Human-readable search results (build_search_summary).
+        tool_id:      The model's tool_use id, for Path B only.
+    """
+    if tool_id:
+        request_data.messages = list(request_data.messages) + [
+            _Message(
+                role="assistant",
+                content=[{
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "web_search",
+                    "input": {"query": query},
+                }],
+            ),
+            _Message(
+                role="user",
+                content=[{
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": summary,
+                }],
+            ),
+        ]
+        return
+
+    msgs = list(request_data.messages)
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].role == "user":
+            msg = msgs[i]
+            if isinstance(msg.content, str):
+                msg.content = f"{msg.content}\n\n{summary}"
+            elif isinstance(msg.content, list):
+                msg.content = list(msg.content) + [
+                    {"type": "text", "text": summary}
+                ]
+            break
+    else:
+        msgs.append(
+            _Message(role="user", content=[{"type": "text", "text": summary}])
+        )
+    request_data.messages = msgs
+
+
+async def _search_continuation_stream(
+    request_data: AnthropicMessagesRequest,
+    auth_manager: Any,
+    profile_arn: Optional[str],
+    message_id: str,
+    metrics: TurnMetrics,
+    start_index: int,
+) -> AsyncGenerator[str, None]:
+    """Call Kiro a second time, with search results in context, and stream it.
+
+    Emits no ``message_start``: the caller already opened the message and wrote
+    the search blocks into it, and Anthropic allows exactly one per message.
+    ``start_index`` continues that block numbering so indices never collide.
+
+    A failure here must not leave the client hanging on an unterminated
+    message, so every error path still closes the message with a text block
+    plus ``message_delta`` / ``message_stop``.
+    """
+    conversation_id = str(uuid.uuid4())
+    http_client = KiroHttpClient(auth_manager, shared_client=None)
+    try:
+        try:
+            kiro_payload, _rewritten = _build_kiro_payload(
+                request_data, conversation_id, profile_arn
+            )
+            url = f"{auth_manager.api_host}/generateAssistantResponse"
+            kiro_response = await http_client.request_with_retry(
+                "POST", url, kiro_payload, stream=True
+            )
+        except Exception as exc:
+            logger.error(
+                f"[anthropic] web_search continuation request failed: {exc}",
+                exc_info=True,
+            )
+            async for frame in _close_message_with_text(
+                start_index,
+                "Web search completed, but the follow-up request to the model "
+                f"failed: {exc}",
+            ):
+                yield frame
+            return
+
+        if kiro_response.status_code != 200:
+            try:
+                err_body = await kiro_response.aread()
+            except Exception:
+                err_body = b"(unreadable)"
+            err_text = err_body.decode("utf-8", errors="replace")
+            logger.warning(
+                f"[anthropic] web_search continuation got "
+                f"{kiro_response.status_code}: {err_text[:200]}"
+            )
+            async for frame in _close_message_with_text(
+                start_index,
+                "Web search completed, but the model returned "
+                f"{kiro_response.status_code}: {err_text[:300]}",
+            ):
+                yield frame
+            return
+
+        async for chunk in stream_to_anthropic_sse(
+            events=_iter_kiro_events(kiro_response),
+            model=request_data.model,
+            message_id=message_id,
+            metrics=metrics,
+            start_index=start_index,
+            emit_message_start=False,
+        ):
+            yield chunk
+    finally:
+        await http_client.close()
+
+
+async def _close_message_with_text(
+    index: int,
+    text: str,
+) -> AsyncGenerator[str, None]:
+    """Emit one text block and terminate the message.
+
+    Used when search succeeded but the continuation call did not: the results
+    are already on the wire, so the turn must end as a valid message rather
+    than an error event the client cannot attach to anything.
+    """
+    yield _sse_frame("content_block_start", {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": {"type": "text", "text": ""},
+    })
+    yield _sse_frame("content_block_delta", {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text},
+    })
+    yield _sse_frame("content_block_stop", {
+        "type": "content_block_stop",
+        "index": index,
+    })
+    yield _sse_frame("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": 0},
+    })
+    yield _sse_frame("message_stop", {"type": "message_stop"})
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +808,14 @@ async def messages(
         )
 
     # ------------------------------------------------------------------
-    # Web Search — Path A: native Anthropic server-side tool (early return)
-    # Detect tools with type starting with "web_search" and route directly
-    # to the MCP API, bypassing /generateAssistantResponse entirely.
-    # This path fires regardless of WEB_SEARCH_ENABLED.
+    # Web Search - Path A: native Anthropic server-side tool
+    # Client asked for Anthropic's server-side web_search. Run the search via
+    # MCP, emit the server-side blocks, then CALL THE MODEL AGAIN with the
+    # results in context and stream its real answer.
+    #
+    # This used to early-return the results and stop, which meant the model
+    # never saw them: the turn ended with search output and no answer, so the
+    # results became the response instead of informing it.
     # ------------------------------------------------------------------
     if request_data.tools:
         for tool in request_data.tools:
@@ -502,24 +825,29 @@ async def messages(
             if tool_type and str(tool_type).startswith("web_search"):
                 from conduit.kiro.mcp import (
                     call_mcp_web_search,
-                    anthropic_web_search_sse,
-                    anthropic_web_search_json,
+                    build_search_summary,
                 )
-                # Extract query from the first user message
+
+                # LAST user message, not the first. The query was previously
+                # scraped from messages[0], so every search in an ongoing
+                # conversation searched the opening line of the session
+                # instead of what was just asked.
                 query: Optional[str] = None
-                for msg in request_data.messages:
-                    if msg.role == "user":
-                        content = msg.content
-                        if isinstance(content, str):
-                            query = content.strip()
-                        elif isinstance(content, list):
-                            parts = []
-                            for blk in content:
-                                if isinstance(blk, dict) and blk.get("type") == "text":
-                                    parts.append(blk.get("text", ""))
-                                elif hasattr(blk, "type") and blk.type == "text":
-                                    parts.append(getattr(blk, "text", ""))
-                            query = "".join(parts).strip()
+                for msg in reversed(list(request_data.messages)):
+                    if msg.role != "user":
+                        continue
+                    content = msg.content
+                    if isinstance(content, str):
+                        query = content.strip()
+                    elif isinstance(content, list):
+                        parts = []
+                        for blk in content:
+                            if isinstance(blk, dict) and blk.get("type") == "text":
+                                parts.append(blk.get("text", ""))
+                            elif getattr(blk, "type", None) == "text":
+                                parts.append(getattr(blk, "text", ""))
+                        query = "".join(parts).strip()
+                    if query:
                         break
 
                 if not query:
@@ -534,7 +862,7 @@ async def messages(
                         },
                     )
 
-                logger.info(f"[anthropic] web_search Path A — query: {query!r}")
+                logger.info(f"[anthropic] web_search Path A - query: {query!r}")
                 ws_tool_use_id, ws_results = await call_mcp_web_search(
                     query, auth_manager
                 )
@@ -551,16 +879,46 @@ async def messages(
                         },
                     )
 
+                summary = build_search_summary(query, ws_results)
+                # Fold results into the conversation, then drop the search tool:
+                # the continuation call must not offer a tool that nothing on
+                # this path is listening to service.
+                _augment_messages_for_search(request_data, query, summary)
+                _strip_web_search_tools(request_data)
+                profile_arn_a = await resolve_profile_arn(auth_manager, PROFILE_ARN)
+
                 if request_data.stream:
                     async def _ws_stream_a() -> AsyncGenerator[str, None]:
-                        async for chunk in anthropic_web_search_sse(
-                            request_data.model,
-                            query,
-                            ws_tool_use_id,
-                            ws_results,
-                            message_id,
+                        metrics_a = TurnMetrics()
+                        yield _sse_frame("message_start", {
+                            "type": "message_start",
+                            "message": {
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "model": request_data.model,
+                                "stop_reason": None,
+                                "stop_sequence": None,
+                                "usage": {"input_tokens": 0, "output_tokens": 0},
+                            },
+                        })
+                        yield _sse_frame("ping", {"type": "ping"})
+                        for frame in _search_block_frames(
+                            0, ws_tool_use_id, query, ws_results
                         ):
-                            yield chunk
+                            yield frame
+                        # Model speaks from index 2: the two search blocks own
+                        # 0 and 1, and indices must not collide in one message.
+                        async for frame in _search_continuation_stream(
+                            request_data,
+                            auth_manager,
+                            profile_arn_a,
+                            message_id,
+                            metrics_a,
+                            2,
+                        ):
+                            yield frame
 
                     return StreamingResponse(
                         _ws_stream_a(),
@@ -571,16 +929,17 @@ async def messages(
                             "X-Accel-Buffering": "no",
                         },
                     )
-                else:
-                    return JSONResponse(
-                        content=anthropic_web_search_json(
-                            request_data.model,
-                            query,
-                            ws_tool_use_id,
-                            ws_results,
-                            message_id,
-                        )
-                    )
+
+                # Non-streaming: fall through to the normal request path below.
+                # request_data now carries the results as context, so the model
+                # answers with them. The server-side blocks are not replayed in
+                # the JSON body - a non-streaming client gets the answer, not
+                # the citation scaffolding.
+                logger.debug(
+                    "[anthropic] web_search Path A (non-streaming) - results "
+                    "folded into context; continuing through the normal path"
+                )
+                break
 
     # ------------------------------------------------------------------
     # Web Search — Path B: auto-inject web_search tool (MCP emulation)
@@ -767,6 +1126,13 @@ async def messages(
             _ws_intercepting = False  # True once we see a web_search tool_use start
             _ws_tool_idx: Optional[int] = None  # SSE block index being intercepted
             _ws_query_buf: list = []             # accumulate input_json_delta fragments
+            # Set once the search results have been handed back to the model and
+            # its continuation stream has been forwarded. The original stream is
+            # finished at that point (the model stopped to call the tool) and it
+            # still owes a message_delta/message_stop pair, which would be a
+            # SECOND terminator for a message the continuation already closed.
+            # So the outer loop stops reading once this is set.
+            _ws_continued = False
 
             try:
                 async for chunk in stream_to_anthropic_sse(
@@ -836,68 +1202,46 @@ async def messages(
                                                 ws_query, auth_manager
                                             )
                                             if ws_res is not None:
-                                                from conduit.kiro.mcp import (
-                                                    anthropic_web_search_sse,
-                                                )
-
-                                                def _sse(et: str, d: dict) -> str:
-                                                    return (
-                                                        f"event: {et}\n"
-                                                        f"data: {json.dumps(d, ensure_ascii=False)}\n\n"
-                                                    )
-
+                                                # The intercepted tool_use owns
+                                                # idx; the two search blocks take
+                                                # idx and idx+1, so the model's
+                                                # continuation starts at idx+2.
+                                                # Anthropic block indices must be
+                                                # unique within one message.
                                                 idx = _ws_tool_idx or 0
-                                                # server_tool_use
-                                                yield _sse("content_block_start", {
-                                                    "type": "content_block_start",
-                                                    "index": idx,
-                                                    "content_block": {
-                                                        "id": ws_tid,
-                                                        "type": "server_tool_use",
-                                                        "name": "web_search",
-                                                        "input": {},
-                                                    },
-                                                })
-                                                yield _sse("content_block_delta", {
-                                                    "type": "content_block_delta",
-                                                    "index": idx,
-                                                    "delta": {
-                                                        "type": "input_json_delta",
-                                                        "partial_json": json.dumps(
-                                                            {"query": ws_query}
-                                                        ),
-                                                    },
-                                                })
-                                                yield _sse("content_block_stop", {
-                                                    "type": "content_block_stop",
-                                                    "index": idx,
-                                                })
-                                                # web_search_tool_result
-                                                sc = [
-                                                    {
-                                                        "type": "web_search_result",
-                                                        "title": r.get("title", ""),
-                                                        "url": r.get("url", ""),
-                                                        "encrypted_content": r.get(
-                                                            "snippet", ""
-                                                        ),
-                                                        "page_age": None,
-                                                    }
-                                                    for r in ws_res.get("results", [])
-                                                ]
-                                                yield _sse("content_block_start", {
-                                                    "type": "content_block_start",
-                                                    "index": idx + 1,
-                                                    "content_block": {
-                                                        "type": "web_search_tool_result",
-                                                        "tool_use_id": ws_tid,
-                                                        "content": sc,
-                                                    },
-                                                })
-                                                yield _sse("content_block_stop", {
-                                                    "type": "content_block_stop",
-                                                    "index": idx + 1,
-                                                })
+                                                for _frame in _search_block_frames(
+                                                    idx, ws_tid, ws_query, ws_res
+                                                ):
+                                                    yield _frame
+
+                                                # Hand the results back as a real
+                                                # tool_result: on this path the
+                                                # MODEL called web_search, so the
+                                                # native round trip is what it is
+                                                # waiting for. Without this the
+                                                # turn ended here - results on
+                                                # screen, question unanswered.
+                                                _augment_messages_for_search(
+                                                    request_data,
+                                                    ws_query,
+                                                    build_search_summary(
+                                                        ws_query, ws_res
+                                                    ),
+                                                    tool_id=ws_tid,
+                                                )
+                                                _strip_web_search_tools(request_data)
+
+                                                async for _frame in _search_continuation_stream(
+                                                    request_data,
+                                                    auth_manager,
+                                                    profile_arn,
+                                                    message_id,
+                                                    metrics,
+                                                    idx + 2,
+                                                ):
+                                                    yield _frame
+
+                                                _ws_continued = True
                                         break  # suppress original stop frame
                                 break  # suppress all other frames while intercepting
                         else:
@@ -905,6 +1249,9 @@ async def messages(
                             if not _ws_intercepting:
                                 yield chunk
                         # If we parsed a break above and didn't yield, don't fall through
+                        if _ws_continued:
+                            # Continuation already closed the message.
+                            break
                         continue
                     # Not an SSE data frame (e.g. blank line) — pass through
                     if not _ws_intercepting:

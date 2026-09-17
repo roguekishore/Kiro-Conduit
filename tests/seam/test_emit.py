@@ -139,6 +139,8 @@ class TestSchemaFieldNames:
             "context_usage_percentage",
             "stop_reason",
             "reasoning_blocks",
+            "context_tokens",
+            "token_accounting",
         }
         got = set(payload["metrics"].keys())
         assert got == expected, (

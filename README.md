@@ -55,5 +55,26 @@ is a known gap in the upstream:
 
 ## Status
 
-Package is importable, `create_app()` builds, and `conduit/contracts/` is frozen.
-Nothing has run against real credentials — that step is maintainer-gated.
+**Running against live credentials.** `state.json` records 456 requests, 449
+successful, 7 failed, with a cached 19-model catalogue. The earlier
+"nothing has run against real credentials" note is obsolete.
+
+Tests: **356 pass, 1 fail** of 357. Run them as
+
+```sh
+PROXY_API_KEY=my-super-secret-password-123 python -m pytest -q
+```
+
+A real `PROXY_API_KEY` in `.env` is read at import time and produces ~14 false
+`401`s that look exactly like a broad regression across doors nothing touched.
+
+The single genuine failure —
+`tests/door_codex/test_codex_freeform.py::test_unadapted_exec_would_reach_kiro_empty`
+— is a stale guard, not a defect. It asserts an unadapted tool still reaches Kiro
+as `{}`, but `sanitize_json_schema` now always forces a top-level
+`{"type": "object"}` because Bedrock rejects schemas without one. The test
+asserts the absence of a behaviour that was deliberately removed; rewrite or
+delete it.
+
+Ecosystem context, and the corrections this README used to get wrong, are in
+`../STATE.md`.

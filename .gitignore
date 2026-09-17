@@ -37,3 +37,6 @@ debug/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Local diagnostic scratch (source backups, calibration probes).
+.diag/

@@ -1,12 +1,24 @@
-"""Real, measured per-turn metrics.
+"""Per-turn metrics, each labelled by how it was obtained.
 
-Every number here is parsed off the wire — from `metadataEvent.tokenUsage`,
-`meteringEvent.usage`, and `contextUsageEvent`. Nothing is estimated. The
-upstream gateway back-calculated input tokens from `contextUsagePercentage`
-and estimated output with `len/4` while exact upstream counts were on the
-wire and being dropped.
+Most numbers here are parsed straight off the wire — `meteringEvent.usage` and
+`contextUsageEvent` — and where `metadataEvent.tokenUsage` is populated, the
+token counters are too.
 
-FROZEN. Lane A populates; Lanes C/D/F read.
+**Revised 2026-09-14.** An earlier revision of this docstring said "Nothing is
+estimated", which was true when written and is no longer. Probing the live
+backend showed its `metadataEvent` carries only `{"stopReason": ...}` — no
+`tokenUsage` at all — so token counters arrived at zero on every request. Token
+accounting is therefore *derived* from `contextUsagePercentage`
+(`conduit.kiro.derive`), which measured exactly against controlled probes.
+
+The upstream gateway did something superficially similar and was rightly
+criticised for it. The difference is disclosure, not technique:
+`token_accounting` states `"upstream"`, `"derived"`, or `"none"` on every turn,
+so no reader can mistake a computed figure for a measured one. Upstream reported
+its estimates as though the provider had stated them.
+
+FROZEN in shape — Lane A populates; Lanes C/D/F read. Adding a field means
+editing CONTRACT-conduit-saga-seam.md, bumping its version, and telling WS-C.
 """
 
 from __future__ import annotations
@@ -63,3 +75,16 @@ class TurnMetrics:
     context_usage_percentage: float = 0.0
     stop_reason: Optional[StopReason] = None
     reasoning_blocks: List[ReasoningBlockMeta] = field(default_factory=list)
+
+    # Whole-turn context footprint: input + output + Kiro's own server-side
+    # system prompt. Inverted from contextUsagePercentage and EXACT (float32
+    # round-trip noise only). Distinct from total_tokens, which mirrors it today
+    # but is the field upstream would populate if it ever reported real counts.
+    context_tokens: int = 0
+
+    # How the token counters above were obtained. The one field that keeps a
+    # derived figure from being read as a measured one:
+    #   "upstream" — metadataEvent.tokenUsage carried real counts
+    #   "derived"  — computed from contextUsagePercentage (see conduit.kiro.derive)
+    #   "none"     — no token accounting available; counters are meaningless
+    token_accounting: str = "none"

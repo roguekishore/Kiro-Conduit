@@ -151,6 +151,19 @@ def apply_metadata_event(metrics: TurnMetrics, payload: Dict[str, Any]) -> None:
         if resolved is not None:
             metrics.stop_reason = resolved
 
+    # --- provenance ---------------------------------------------------------
+    # Any nonzero counter means tokenUsage was really present, which locks out
+    # the derived path: a measured figure is never overwritten by an estimate.
+    if any((
+        metrics.input_tokens,
+        metrics.output_tokens,
+        metrics.thought_tokens,
+        metrics.cache_read_tokens,
+        metrics.cache_write_tokens,
+        metrics.total_tokens,
+    )):
+        metrics.token_accounting = "upstream"
+
     # --- normalizedTokenUsage (supplementary; use only for fields still 0) --
     normalized: Dict[str, Any] = token_usage.get("normalizedTokenUsage", {})
     if isinstance(normalized, dict) and normalized:

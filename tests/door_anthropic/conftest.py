@@ -157,3 +157,94 @@ async def make_tool_use_events(tool_id: str, tool_name: str, tool_input: dict):
     yield KiroEvent(
         name=EventName.MESSAGE_STOP, payload={"stopReason": "TOOL_USE"}
     )
+
+
+# ---------------------------------------------------------------------------
+# Fragmented tool use -- what the wire actually sends
+# ---------------------------------------------------------------------------
+# The fragments below are the real ones observed for a single Bash call
+# (SAGA request req_01M2G3K0E9BPWP4MNM1KVE2W46): an opening frame carrying
+# `name` with an empty input, eleven raw JSON string fragments, then a closing
+# frame with `stop`. Kept verbatim rather than tidied so the test exercises the
+# awkward split points -- mid-word ("rking dir" / "ec") and mid-token (", \"").
+
+REAL_BASH_FRAGMENTS = [
+    '{"command": ',
+    '"pwd',
+    ' && ls"',
+    ', "',
+    'description',
+    '": "Show wo',
+    'rking dir',
+    'ec',
+    'tory and c',
+    'onte',
+    'nts"}',
+]
+
+
+async def make_fragmented_tool_use_events(
+    tool_id: str,
+    tool_name: str,
+    fragments: List[str],
+    stop_reason: str = "TOOL_USE",
+    emit_stop_frame: bool = True,
+):
+    """One tool call streamed as many toolUseEvent frames sharing one id."""
+    yield KiroEvent(
+        name=EventName.TOOL_USE,
+        payload={"toolUseId": tool_id, "name": tool_name, "input": {}},
+    )
+    for frag in fragments:
+        yield KiroEvent(
+            name=EventName.TOOL_USE,
+            payload={"toolUseId": tool_id, "name": tool_name, "input": frag},
+        )
+    if emit_stop_frame:
+        yield KiroEvent(
+            name=EventName.TOOL_USE,
+            payload={
+                "toolUseId": tool_id,
+                "name": tool_name,
+                "input": {},
+                "stop": True,
+            },
+        )
+    yield KiroEvent(
+        name=EventName.METADATA,
+        payload={
+            "tokenUsage": {
+                "inputTokens": 150,
+                "outputTokens": 30,
+                "totalTokens": 180,
+            }
+        },
+    )
+    yield KiroEvent(name=EventName.MESSAGE_STOP, payload={"stopReason": stop_reason})
+
+
+async def make_two_fragmented_tool_calls():
+    """Two tool calls back to back, each streamed as fragments."""
+    for tool_id, frags in (
+        ("toolu_first000000000000000000", ['{"command": ', '"pwd"}']),
+        ("toolu_second00000000000000000", ['{"command": ', '"ls"}']),
+    ):
+        yield KiroEvent(
+            name=EventName.TOOL_USE,
+            payload={"toolUseId": tool_id, "name": "Bash", "input": {}},
+        )
+        for frag in frags:
+            yield KiroEvent(
+                name=EventName.TOOL_USE,
+                payload={"toolUseId": tool_id, "name": "Bash", "input": frag},
+            )
+        yield KiroEvent(
+            name=EventName.TOOL_USE,
+            payload={
+                "toolUseId": tool_id,
+                "name": "Bash",
+                "input": {},
+                "stop": True,
+            },
+        )
+    yield KiroEvent(name=EventName.MESSAGE_STOP, payload={"stopReason": "TOOL_USE"})

@@ -384,7 +384,11 @@ def _ensure_starts_with_user(messages: List[HistoryMessage]) -> List[HistoryMess
 
 def _ensure_alternating(messages: List[HistoryMessage]) -> List[HistoryMessage]:
     """
-    Insert synthetic assistant messages between consecutive user turns.
+    Insert synthetic turns to ensure strict user/assistant alternation.
+
+    Handles both directions:
+    - consecutive user turns    → insert synthetic empty assistant turn between them
+    - consecutive assistant turns → insert synthetic empty user turn between them
 
     Uses empty content (``""``) rather than the upstream ``"(empty placeholder)"``
     sentinel so the model's history is not polluted with fabricated text.
@@ -396,14 +400,18 @@ def _ensure_alternating(messages: List[HistoryMessage]) -> List[HistoryMessage]:
     synthetic_count = 0
 
     for msg in messages[1:]:
-        if msg.role == "user" and result[-1].role == "user":
+        prev_role = result[-1].role
+        if msg.role == "user" and prev_role == "user":
             result.append(HistoryMessage(role="assistant", content=""))
+            synthetic_count += 1
+        elif msg.role == "assistant" and prev_role == "assistant":
+            result.append(HistoryMessage(role="user", content=""))
             synthetic_count += 1
         result.append(msg)
 
     if synthetic_count:
         logger.debug(
-            f"Inserted {synthetic_count} synthetic empty assistant turn(s) "
+            f"Inserted {synthetic_count} synthetic empty turn(s) "
             "to satisfy Kiro alternation requirement"
         )
 

@@ -846,7 +846,8 @@ async def translate_kiro_to_responses_sse(
             elif name == EventName.METERING:
                 apply_metering_event(metrics, payload)
 
-            elif name == EventName.METADATA:
+            elif name in (EventName.METADATA, EventName.MESSAGE_METADATA):
+                # Both wire spellings carry tokenUsage; see the Anthropic door.
                 apply_metadata_event(metrics, payload)
 
             elif name == EventName.CONTEXT_USAGE:

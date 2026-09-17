@@ -20,10 +20,13 @@ import pytest
 from conduit.contracts.events import EventName, KiroEvent, UnknownEvent
 from conduit.contracts.metrics import StopReason, TurnMetrics
 from tests.door_anthropic.conftest import (
+    REAL_BASH_FRAGMENTS,
     collect_sse,
+    make_fragmented_tool_use_events,
     make_text_events,
     make_thinking_events,
     make_tool_use_events,
+    make_two_fragmented_tool_calls,
     parse_sse_stream,
 )
 
@@ -615,3 +618,182 @@ async def test_thinking_then_tool_sequence():
     # Stop reason should be tool_use
     md = events_of_type(evts, "message_delta")[0]
     assert md["delta"]["stop_reason"] == "tool_use"
+
+
+# ===========================================================================
+# 4b. Fragmented tool use -- the regression that broke every Bash call
+# ===========================================================================
+# Kiro streams one tool call as many toolUseEvent frames sharing a toolUseId.
+# Emitting a block per frame produced N sibling tool_use blocks whose first
+# input was `{}`, so the harness rejected the call with "required parameter
+# 'command' is missing" before any command reached the shell. These tests
+# pin the reassembly.
+
+FRAG_TOOL_ID = "toolu_bdrk_016sMxMSApr3U7bAuamCi3xR"
+EXPECTED_FRAG_INPUT = {
+    "command": "pwd && ls",
+    "description": "Show working directory and contents",
+}
+
+
+@pytest.mark.asyncio
+async def test_fragmented_tool_use_emits_exactly_one_block():
+    """Eleven input fragments must collapse into ONE tool_use block."""
+    evts, _ = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS
+        )
+    )
+    starts = [
+        d for d in events_of_type(evts, "content_block_start")
+        if d["content_block"]["type"] == "tool_use"
+    ]
+    assert len(starts) == 1, f"expected 1 tool_use block, got {len(starts)}"
+    assert starts[0]["content_block"]["id"] == FRAG_TOOL_ID
+    assert starts[0]["content_block"]["name"] == "Bash"
+
+
+@pytest.mark.asyncio
+async def test_fragmented_tool_use_input_reassembles():
+    """The joined fragments must parse back into the original input dict."""
+    evts, _ = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS
+        )
+    )
+    deltas = [
+        d for d in events_of_type(evts, "content_block_delta")
+        if d["delta"]["type"] == "input_json_delta"
+    ]
+    assert len(deltas) == 1, f"expected 1 input_json_delta, got {len(deltas)}"
+    assert json.loads(deltas[0]["delta"]["partial_json"]) == EXPECTED_FRAG_INPUT
+
+
+@pytest.mark.asyncio
+async def test_fragmented_tool_input_is_not_double_encoded():
+    """partial_json must be a JSON object, never a JSON-encoded string.
+
+    json.dumps() on an already-JSON string fragment is what put escaped quotes
+    on the wire; the decoded value came back as str instead of dict.
+    """
+    evts, _ = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS
+        )
+    )
+    delta = [
+        d for d in events_of_type(evts, "content_block_delta")
+        if d["delta"]["type"] == "input_json_delta"
+    ][0]
+    decoded = json.loads(delta["delta"]["partial_json"])
+    assert isinstance(decoded, dict), f"double-encoded: got {type(decoded)}"
+
+
+@pytest.mark.asyncio
+async def test_fragmented_tool_use_emits_one_stop():
+    evts, _ = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS
+        )
+    )
+    types = event_types(evts)
+    assert types.count("content_block_start") == types.count("content_block_stop")
+    assert types.count("content_block_start") == 1
+
+
+@pytest.mark.asyncio
+async def test_fragmented_tool_use_never_emits_empty_input():
+    """No delta may carry `{}` -- that empty first input was the actual failure."""
+    evts, _ = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS
+        )
+    )
+    for d in events_of_type(evts, "content_block_delta"):
+        if d["delta"]["type"] == "input_json_delta":
+            assert d["delta"]["partial_json"].strip() != "{}"
+
+
+@pytest.mark.asyncio
+async def test_unterminated_fragmented_tool_use_still_flushes():
+    """A stream ending without the `stop` frame still owes a complete block."""
+    evts, _ = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS, emit_stop_frame=False
+        )
+    )
+    deltas = [
+        d for d in events_of_type(evts, "content_block_delta")
+        if d["delta"]["type"] == "input_json_delta"
+    ]
+    assert len(deltas) == 1
+    assert json.loads(deltas[0]["delta"]["partial_json"]) == EXPECTED_FRAG_INPUT
+    types = event_types(evts)
+    assert types.count("content_block_stop") == 1
+
+
+@pytest.mark.asyncio
+async def test_two_fragmented_tool_calls_stay_separate():
+    """Distinct toolUseIds must produce two blocks at distinct indices."""
+    evts, _ = await collect_sse(make_two_fragmented_tool_calls())
+    starts = [
+        d for d in events_of_type(evts, "content_block_start")
+        if d["content_block"]["type"] == "tool_use"
+    ]
+    assert len(starts) == 2
+    assert starts[0]["index"] != starts[1]["index"]
+    assert starts[0]["content_block"]["id"] != starts[1]["content_block"]["id"]
+
+    deltas = [
+        d for d in events_of_type(evts, "content_block_delta")
+        if d["delta"]["type"] == "input_json_delta"
+    ]
+    assert len(deltas) == 2
+    assert json.loads(deltas[0]["delta"]["partial_json"]) == {"command": "pwd"}
+    assert json.loads(deltas[1]["delta"]["partial_json"]) == {"command": "ls"}
+
+
+@pytest.mark.asyncio
+async def test_unmeasured_turn_omits_token_fields_rather_than_reporting_zero():
+    """No metadataEvent -> no input/cache keys at all.
+
+    A zero would assert "this turn consumed no input", which is a fabricated
+    measurement. Absence is the truthful encoding of "not reported by Kiro".
+    """
+    evts, metrics = await collect_sse(make_two_fragmented_tool_calls())
+    usage = events_of_type(evts, "message_delta")[-1]["usage"]
+
+    assert metrics.input_tokens == 0, "fixture must carry no metadataEvent"
+    assert "input_tokens" not in usage
+    assert "cache_read_input_tokens" not in usage
+    assert "cache_creation_input_tokens" not in usage
+
+
+@pytest.mark.asyncio
+async def test_measured_turn_reports_input_tokens_on_the_wire():
+    """When Kiro does report tokenUsage, input_tokens must reach the client.
+
+    Guards the other half: the count was previously parsed into TurnMetrics and
+    then dropped, so it was measured and still invisible to the harness.
+    """
+    evts, metrics = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS
+        )
+    )
+    usage = events_of_type(evts, "message_delta")[-1]["usage"]
+
+    assert metrics.input_tokens == 150  # fixture metadataEvent value
+    assert usage["input_tokens"] == 150
+    assert usage["output_tokens"] == 30
+
+
+@pytest.mark.asyncio
+async def test_fragmented_tool_use_reports_tool_use_stop_reason():
+    evts, _ = await collect_sse(
+        make_fragmented_tool_use_events(
+            FRAG_TOOL_ID, "Bash", REAL_BASH_FRAGMENTS
+        )
+    )
+    deltas = events_of_type(evts, "message_delta")
+    assert deltas[-1]["delta"]["stop_reason"] == "tool_use"

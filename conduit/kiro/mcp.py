@@ -214,6 +214,56 @@ def build_search_summary(query: str, results: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_replayed_search(results: Any) -> str:
+    """Render a replayed ``web_search_tool_result`` payload back into text.
+
+    Distinct from :func:`build_search_summary`, which formats a *fresh* MCP
+    response (``snippet`` keys). This one formats what a CLIENT replays back on
+    a later request: Anthropic-shaped ``web_search_result`` blocks whose text
+    lives in ``encrypted_content``.
+
+    Without this, replayed search blocks reach the Kiro payload builder, match
+    no known block type, and are dropped - so a follow-up question about search
+    results is answered by a model that can no longer see them.
+
+    Args:
+        results: The ``content`` of a ``web_search_tool_result`` block. Normally
+                 a list of ``web_search_result`` blocks; an error dict or bare
+                 string is also possible.
+
+    Returns:
+        Formatted text, or "" when there is nothing renderable.
+    """
+    if not results:
+        return ""
+    if isinstance(results, str):
+        return f"\n<web_search>\n{results}\n</web_search>\n"
+    if isinstance(results, dict):
+        code = results.get("error_code") or results
+        return f"\n<web_search>\n{code}\n</web_search>\n"
+    if not isinstance(results, list):
+        return ""
+
+    lines = [f"\n<web_search>\nReplayed search results:\n"]
+    for i, item in enumerate(results, 1):
+        if isinstance(item, dict):
+            title = item.get("title", "")
+            url = item.get("url", "")
+            snippet = item.get("encrypted_content", "")
+        else:
+            title = getattr(item, "title", "")
+            url = getattr(item, "url", "")
+            snippet = getattr(item, "encrypted_content", "")
+        lines.append(f"{i}. Title: {title}")
+        if url:
+            lines.append(f"   URL: {url}")
+        if snippet:
+            lines.append(f"   {snippet}")
+        lines.append("")
+    lines.append("</web_search>")
+    return "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # SSE emitter (Anthropic format, Path A)
 # ---------------------------------------------------------------------------
