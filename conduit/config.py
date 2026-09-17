@@ -440,69 +440,6 @@ def _warn_timeout_configuration():
         print(warning_text, file=sys.stderr)
 
 # ==================================================================================================
-# Fake Reasoning Settings (Extended Thinking via Tag Injection)
-# ==================================================================================================
-
-# Enable fake reasoning - injects special tags into requests to enable model reasoning.
-# When enabled, the model will include its reasoning process in the response wrapped in tags.
-# The response is then parsed and converted to OpenAI-compatible reasoning_content format.
-#
-# WHY "FAKE"? This is NOT native extended thinking API support. Instead, we inject
-# <thinking_mode>enabled</thinking_mode> tags into the prompt, and the model responds
-# with <thinking>...</thinking> blocks that we parse and convert to reasoning_content.
-# It works great, but it's a hack - hence "fake" reasoning.
-#
-# Default: true (enabled) - provides premium experience out of the box
-_FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
-# Default is True - if env var is not set or empty, enable fake reasoning
-FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
-
-# Maximum thinking length in tokens (default budget when client doesn't specify).
-# This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
-# Higher values allow for more detailed reasoning but increase response time and token usage.
-# Default: 4000 tokens
-FAKE_REASONING_MAX_TOKENS: int = int(os.getenv("FAKE_REASONING_MAX_TOKENS", "4000"))
-
-# Maximum budget cap for fake reasoning when client sends thinking budget.
-#
-# WHY CAP? Fake reasoning uses output tokens (not separate thinking tokens like native API).
-# Large budgets can cause the model to spend ALL output tokens on reasoning with NOTHING
-# left for actual content. This cap prevents that.
-#
-# Default: 10000 tokens (2.5x default budget of 4000)
-# - Allows deeper reasoning than default
-# - Prevents excessive token consumption
-# - Still leaves room for actual response
-#
-# Set to 0 to disable capping (not recommended for production).
-FAKE_REASONING_BUDGET_CAP: int = int(os.getenv("FAKE_REASONING_BUDGET_CAP", "10000"))
-
-# How to handle the thinking block in responses:
-# - "as_reasoning_content": Extract to reasoning_content field (OpenAI-compatible, recommended)
-# - "remove": Remove thinking block completely, return only final answer
-# - "pass": Pass through as-is with original tags in content
-# - "strip_tags": Remove tags but keep thinking content in regular content
-#
-# Default: "as_reasoning_content"
-_FAKE_REASONING_HANDLING_RAW: str = os.getenv("FAKE_REASONING_HANDLING", "as_reasoning_content").lower()
-if _FAKE_REASONING_HANDLING_RAW in ("as_reasoning_content", "remove", "pass", "strip_tags"):
-    FAKE_REASONING_HANDLING: str = _FAKE_REASONING_HANDLING_RAW
-else:
-    FAKE_REASONING_HANDLING: str = "as_reasoning_content"
-
-# List of opening tags to detect thinking blocks.
-# The parser will look for any of these tags at the start of the response.
-# Order matters - first match wins.
-FAKE_REASONING_OPEN_TAGS: List[str] = ["<thinking>", "<think>", "<reasoning>", "<thought>"]
-
-# Maximum size of initial buffer for tag detection (characters).
-# If no thinking tag is found within this limit, content is treated as regular response.
-# Lower values = faster first token, but may miss tags with leading whitespace.
-# Default: 30 characters (enough for longest tag + some whitespace)
-FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20"))
-
-
-# ==================================================================================================
 # Payload Size Guard Settings
 # ==================================================================================================
 
