@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
+import conduit.config as cfg
 from conduit.config import (
     PROFILE_ARN,
     PROXY_API_KEY,
@@ -55,6 +56,12 @@ from conduit.kiro.history import HistoryMessage
 from conduit.kiro.mcp import render_replayed_search
 from conduit.kiro.request import build_conversation_state
 from conduit.kiro.tools import build_tool_results_from_anthropic
+from conduit.kiro.truncation import (
+    notice_for_content,
+    notice_for_tool,
+    take_content_truncation,
+    take_tool_truncation,
+)
 from conduit.kiro.derive import derive_token_accounting
 from conduit.kiro.usage import (
     apply_context_usage_event,
@@ -369,13 +376,43 @@ def _to_history_messages(
 
         tool_results = build_tool_results_from_anthropic(msg.content) or None
 
+        # A tool result whose originating call Kiro truncated gets the reason
+        # prepended, so the model reads the failure as an upstream size limit
+        # rather than as its own mistake. Retrieval clears the record, so the
+        # notice appears exactly once.
+        if tool_results and cfg.TRUNCATION_RECOVERY:
+            for result in tool_results:
+                record = take_tool_truncation(result.get("toolUseId", ""))
+                if not record:
+                    continue
+                notice = notice_for_tool(record)
+                existing = result.get("content") or []
+                result["content"] = [{"text": notice}, *existing]
+                logger.info(
+                    f"[anthropic] prepended truncation notice to tool result "
+                    f"{record.tool_use_id} ({record.tool_name})"
+                )
+
+        joined_text = "\n".join(text_parts)
+
         out.append(HistoryMessage(
             role=msg.role,
-            content="\n".join(text_parts),
+            content=joined_text,
             tool_calls=tool_calls or None,
             tool_results=tool_results,
             images=images or None,
         ))
+
+        # An assistant turn Kiro cut off is followed by a user turn saying so.
+        # Without it the model reads its own half-finished text as a completed
+        # thought and typically restates it from the top.
+        if msg.role == "assistant" and joined_text and cfg.TRUNCATION_RECOVERY:
+            if take_content_truncation(joined_text):
+                out.append(HistoryMessage(role="user", content=notice_for_content()))
+                logger.info(
+                    "[anthropic] inserted content-truncation notice after "
+                    "truncated assistant turn"
+                )
 
     return out
 

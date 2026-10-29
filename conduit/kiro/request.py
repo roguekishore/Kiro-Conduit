@@ -40,6 +40,7 @@ from loguru import logger
 import conduit.config as cfg
 from conduit.contracts.rewritten import Injection, InjectionType, RewrittenOut
 from conduit.kiro.history import HistoryMessage, merge_turns
+from conduit.kiro.payload_guards import apply_payload_guards
 from conduit.kiro.reasoning import build_reasoning_fields
 from conduit.kiro.tools import (
     build_tool_result,
@@ -185,11 +186,13 @@ def build_conversation_state(
     1. Merge consecutive same-role turns (history.py).
     2. Ensure protocol alternation (user/assistant interleaving).
     3. Split into ``history`` and ``currentMessage``.
-    4. Place ``systemPrompt`` natively or prepend into first user message,
-       controlled by ``cfg.KIRO_NATIVE_SYSTEM_PROMPT``.
-    5. Convert tools to Kiro ``toolSpecification`` shape (tools.py).
+    4. Convert tools to Kiro ``toolSpecification`` shape, relocating oversized
+       descriptions into a documentation block (tools.py).
+    5. Place ``systemPrompt`` (plus any relocated tool docs) natively or prepend
+       into first user message, controlled by ``cfg.KIRO_NATIVE_SYSTEM_PROMPT``.
     6. Build ``additionalModelRequestFields`` with reasoning knobs (reasoning.py).
-    7. Assemble the final payload and a self-describing ``RewrittenOut``.
+    7. Assemble the payload, then run protocol/size guards over it
+       (payload_guards.py) before reporting it in ``RewrittenOut``.
 
     Note on empty content: Kiro requires non-empty ``content`` in every
     message.  Any message with empty content receives the sentinel ``" "``
@@ -250,9 +253,31 @@ def build_conversation_state(
     current_msg = merged[-1]
 
     # ------------------------------------------------------------------
-    # 4. System prompt placement
+    # 4. Tools — must precede system-prompt placement, because an oversized
+    #    tool description is relocated INTO the system prompt.
+    # ------------------------------------------------------------------
+    kiro_tools: List[Dict[str, Any]] = []
+    tool_documentation = ""
+    if tools:
+        kiro_tools, tool_documentation = build_tool_specs(
+            tools,
+            max_description_length=cfg.TOOL_DESCRIPTION_MAX_LENGTH,
+        )
+
+    # ------------------------------------------------------------------
+    # 5. System prompt placement
     # ------------------------------------------------------------------
     system_text = (system_prompt or "").strip()
+
+    if tool_documentation:
+        system_text = (system_text + tool_documentation).strip()
+        injections.append(
+            Injection(
+                type=InjectionType.RELOCATED_TOOL_DOCS,
+                location="systemPrompt" if cfg.KIRO_NATIVE_SYSTEM_PROMPT
+                else "first_user_message",
+            )
+        )
 
     if system_text:
         if cfg.KIRO_NATIVE_SYSTEM_PROMPT:
@@ -274,13 +299,6 @@ def build_conversation_state(
                 )
             )
             logger.debug("system prompt → prepended into first user message (fallback mode)")
-
-    # ------------------------------------------------------------------
-    # 5. Tools
-    # ------------------------------------------------------------------
-    kiro_tools: List[Dict[str, Any]] = []
-    if tools:
-        kiro_tools = build_tool_specs(tools)
 
     # ------------------------------------------------------------------
     # 6. Reasoning / additionalModelRequestFields
@@ -351,12 +369,33 @@ def build_conversation_state(
         payload["profileArn"] = profile_arn.strip()
 
     # ------------------------------------------------------------------
-    # 11. Build RewrittenOut
+    # 11. Protocol + size guards
+    # ------------------------------------------------------------------
+    # Orphaned tool results (a toolResult whose toolUseId no preceding
+    # assistant turn declared) make Kiro reject the entire request with
+    # "Improperly formed request." (reason: null). Compaction, resume, and
+    # mid-tool-call forks all produce exactly that shape, so the repair runs
+    # unconditionally — unlike upstream, where it is reachable only with
+    # AUTO_TRIM_PAYLOAD on and therefore never runs by default.
+    apply_payload_guards(
+        payload,
+        max_bytes=cfg.KIRO_MAX_PAYLOAD_BYTES,
+        auto_trim=cfg.AUTO_TRIM_PAYLOAD,
+    )
+
+    # Guards mutate history in place; re-read so RewrittenOut reports what is
+    # actually on the wire rather than the pre-guard draft. The seam's whole
+    # purpose is showing what Kiro received.
+    guarded_state = payload["conversationState"]
+    guarded_history = guarded_state.get("history", [])
+
+    # ------------------------------------------------------------------
+    # 12. Build RewrittenOut
     # ------------------------------------------------------------------
     rewritten = RewrittenOut(
         system_prompt=system_text if system_text else None,
-        current_message=current_message_dict,
-        history=history,
+        current_message=guarded_state["currentMessage"],
+        history=guarded_history,
         tools=kiro_tools,
         injections=injections,
     )

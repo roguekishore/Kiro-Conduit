@@ -22,10 +22,23 @@ mis-labelling every Codex tool result as an error.  Lane D SHOULD inspect
 its own result objects and pass the correct flag when the information is
 available.
 
+Design decision — oversized tool descriptions
+----------------------------------------------
+Kiro answers a request whose ``toolSpecification.description`` is very long with
+the same misleading ``400 "Improperly formed request."`` it uses for every other
+shape problem.  Rather than truncate (which destroys instructions the model
+needs), a description over ``TOOL_DESCRIPTION_MAX_LENGTH`` is **relocated** into
+the system prompt under a ``## Tool: <name>`` heading, and the spec keeps a
+pointer to it.  Nothing is lost; it moves.
+
+This is a real injection, so it is declared as ``RELOCATED_TOOL_DOCS`` in
+``RewrittenOut.injections`` — the seam shows relocation happened rather than
+leaving SAGA to infer it from a diff.
+
 Public API
 ----------
 - build_tool_spec()    — single Anthropic/Codex tool → Kiro toolSpecification
-- build_tool_specs()   — list conversion
+- build_tool_specs()   — list conversion, with oversized-description relocation
 - build_tool_result()  — single tool-result dict in Kiro wire format
 - sanitize_json_schema() — strip fields the Kiro API rejects
 """
@@ -33,7 +46,7 @@ Public API
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -136,7 +149,8 @@ def build_tool_spec(
 
 def build_tool_specs(
     tools: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    max_description_length: int = 0,
+) -> Tuple[List[Dict[str, Any]], str]:
     """
     Convert a list of tool definitions (Anthropic or Codex shape) to Kiro format.
 
@@ -146,20 +160,59 @@ def build_tool_specs(
     Anthropic shape:  ``{"name": str, "description": str, "input_schema": {...}}``
     Codex shape:      ``{"name": str, "description": str, "parameters": {...}}``
 
+    Oversized descriptions
+    ----------------------
+    When ``max_description_length`` is positive, any description longer than it is
+    moved into a documentation block for the system prompt and replaced in the
+    spec by a pointer.  The full text survives — it changes location, not content.
+    Pass ``0`` (the default) to disable relocation entirely and send every
+    description as-is.
+
     Args:
-        tools: List of tool dicts.
+        tools:                  List of tool dicts.
+        max_description_length: Relocation threshold in characters; 0 disables.
 
     Returns:
-        List of Kiro ``toolSpecification`` wrappers.
+        ``(kiro_tools, tool_documentation)`` where ``tool_documentation`` is the
+        markdown block to append to the system prompt, or ``""`` when nothing was
+        relocated.
     """
-    kiro_tools = []
+    kiro_tools: List[Dict[str, Any]] = []
+    doc_parts: List[str] = []
+
     for t in tools:
         name = t.get("name", "")
         description = t.get("description")
         # Anthropic uses input_schema; Codex / OpenAI uses parameters
         input_schema = t.get("input_schema") or t.get("parameters") or {}
+
+        if (
+            max_description_length > 0
+            and description
+            and len(description) > max_description_length
+        ):
+            logger.debug(
+                f"Tool {name!r} description is {len(description)} chars "
+                f"(> {max_description_length}); relocating to system prompt"
+            )
+            doc_parts.append(f"## Tool: {name}\n\n{description}")
+            description = (
+                f"[Full documentation in system prompt under '## Tool: {name}']"
+            )
+
         kiro_tools.append(build_tool_spec(name, description, input_schema))
-    return kiro_tools
+
+    tool_documentation = ""
+    if doc_parts:
+        tool_documentation = (
+            "\n\n---\n"
+            "# Tool Documentation\n"
+            "The following tools have documentation too long to fit in their "
+            "tool definition. Their definitions point here.\n\n"
+            + "\n\n---\n\n".join(doc_parts)
+        )
+
+    return kiro_tools, tool_documentation
 
 
 # ---------------------------------------------------------------------------

@@ -579,11 +579,13 @@ class TestToolConversion:
             {"name": "read_file", "description": "Reads a file", "input_schema": {"type": "object"}},
             {"name": "write_file", "description": "Writes a file", "input_schema": {"type": "object"}},
         ]
-        specs = build_tool_specs(tools)
+        specs, docs = build_tool_specs(tools)
         assert len(specs) == 2
         names = [s["toolSpecification"]["name"] for s in specs]
         assert "read_file" in names
         assert "write_file" in names
+        # Nothing oversized, so no relocation block.
+        assert docs == ""
 
     def test_sanitize_removes_empty_required(self):
         schema = {"type": "object", "required": [], "properties": {"x": {"type": "string"}}}

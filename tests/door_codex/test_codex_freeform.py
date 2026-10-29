@@ -157,13 +157,15 @@ class TestFreeformToolAdaptation:
     def test_kiro_receives_a_usable_schema(self):
         """The regression that mattered: exec used to reach Kiro as {}."""
         adapted, _ = adapt_freeform_tools([EXEC])
-        spec = build_tool_specs(adapted)[0]["toolSpecification"]
+        specs, _docs = build_tool_specs(adapted)
+        spec = specs[0]["toolSpecification"]
         assert spec["inputSchema"]["json"] != {}
         assert FREEFORM_PARAM in spec["inputSchema"]["json"]["properties"]
 
     def test_unadapted_exec_would_reach_kiro_empty(self):
         """Documents the original defect, so it cannot quietly return."""
-        spec = build_tool_specs([EXEC])[0]["toolSpecification"]
+        specs, _docs = build_tool_specs([EXEC])
+        spec = specs[0]["toolSpecification"]
         assert spec["inputSchema"]["json"] == {}
 
 

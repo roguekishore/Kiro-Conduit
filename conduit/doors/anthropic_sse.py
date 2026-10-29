@@ -28,9 +28,15 @@ from typing import Any, AsyncGenerator, AsyncIterable, Dict, List, Optional
 
 from loguru import logger
 
+import conduit.config as cfg
 from conduit.contracts.events import DispatchedEvent, EventName, KiroEvent, UnknownEvent
 from conduit.contracts.metrics import ReasoningBlockMeta, StopReason, TurnMetrics
 from conduit.kiro.derive import derive_token_accounting
+from conduit.kiro.truncation import (
+    diagnose_json_truncation,
+    record_content_truncation,
+    record_tool_truncation,
+)
 from conduit.kiro.usage import (
     apply_context_usage_event,
     apply_metadata_event,
@@ -174,6 +180,19 @@ async def stream_to_anthropic_sse(
     tool_idx: Optional[int] = None
     tool_id: Optional[str] = None
     tool_json: List[str] = []
+    # Tool names by id, so a truncation record can name the tool that was cut
+    # off: the name arrives on the opening frame, the truncation is discovered
+    # at the closing one.
+    tool_name_by_id: Dict[str, str] = {}
+    # Whether Kiro cut off a tool call or the assistant text this turn. Both are
+    # invisible on the wire -- the stream simply stops -- so they are inferred.
+    saw_tool_truncation = False
+    # Set when the stream ends without messageStopEvent, which is how a cut-off
+    # text response presents.
+    stream_completed_normally = False
+    # Assistant text accumulated this turn, needed to key a content-truncation
+    # record by content hash.
+    full_text: List[str] = []
     # Characters CONDUIT streamed out this turn -- assistant text plus tool-call
     # JSON. The only handle on output size, since Kiro reports no output count
     # and the context percentage folds input and output into one figure.
@@ -263,7 +282,7 @@ async def stream_to_anthropic_sse(
         nonlocal tool_open, tool_idx, tool_id, tool_json
         if not tool_open:
             return
-        nonlocal output_chars
+        nonlocal output_chars, saw_tool_truncation
         partial = "".join(tool_json).strip() or "{}"
         output_chars += len(partial)
         # Validated, not repaired: a fragment run that does not reassemble into
@@ -272,10 +291,24 @@ async def stream_to_anthropic_sse(
         try:
             json.loads(partial)
         except json.JSONDecodeError:
-            logger.warning(
-                f"[anthropic_sse] tool {tool_id!r} input did not reassemble into "
-                f"valid JSON from {len(tool_json)} fragment(s); forwarding as-is"
-            )
+            # Distinguish "Kiro cut this off" from "the model emitted bad JSON".
+            # Only the first is worth telling the model about on its next
+            # request, and only the first makes an identical retry pointless.
+            diag = diagnose_json_truncation(partial)
+            if diag["is_truncated"] and cfg.TRUNCATION_RECOVERY:
+                saw_tool_truncation = True
+                record_tool_truncation(
+                    tool_use_id=tool_id or "",
+                    tool_name=tool_name_by_id.get(tool_id or "", "unknown"),
+                    size_bytes=diag["size_bytes"],
+                    reason=diag["reason"],
+                )
+            else:
+                logger.warning(
+                    f"[anthropic_sse] tool {tool_id!r} input did not reassemble into "
+                    f"valid JSON from {len(tool_json)} fragment(s) "
+                    f"({diag['reason']}); forwarding as-is"
+                )
         yield _sse("content_block_delta", {
             "type": "content_block_delta",
             "index": tool_idx,
@@ -319,6 +352,7 @@ async def stream_to_anthropic_sse(
                         yield chunk
 
                 output_chars += len(text)
+                full_text.append(text)
                 yield _sse("content_block_delta", {
                     "type": "content_block_delta",
                     "index": text_idx,
@@ -415,6 +449,8 @@ async def stream_to_anthropic_sse(
                     tool_count += 1
                     tool_json = []
                     tool_open = True
+                    if ev_tool_name:
+                        tool_name_by_id[tool_id] = ev_tool_name
 
                     yield _sse("content_block_start", {
                         "type": "content_block_start",
@@ -487,6 +523,7 @@ async def stream_to_anthropic_sse(
             # messageStopEvent → stop reason
             # ------------------------------------------------------------------
             elif name == EventName.MESSAGE_STOP:
+                stream_completed_normally = True
                 kiro_reason = payload.get("stopReason")
                 try:
                     metrics.stop_reason = StopReason(kiro_reason) if kiro_reason else None
@@ -525,6 +562,22 @@ async def stream_to_anthropic_sse(
             yield chunk
 
     # -----------------------------------------------------------------------
+    # Content truncation
+    # -----------------------------------------------------------------------
+    # A cut-off text response has no wire signal: the stream just ends without
+    # messageStopEvent. Tool turns are excluded because a tool call ending the
+    # stream is normal, and a truncated tool call is already recorded above by
+    # its own, more precise, JSON check.
+    assistant_text = "".join(full_text)
+    content_was_truncated = (
+        not stream_completed_normally
+        and bool(assistant_text)
+        and tool_count == 0
+    )
+    if content_was_truncated and cfg.TRUNCATION_RECOVERY:
+        record_content_truncation(assistant_text)
+
+    # -----------------------------------------------------------------------
     # Derive token accounting when upstream reported none
     # -----------------------------------------------------------------------
     # Runs after the stream closes: contextUsagePercentage is sampled post-
@@ -534,7 +587,12 @@ async def stream_to_anthropic_sse(
     # -----------------------------------------------------------------------
     # Determine stop reason for Anthropic wire format
     # -----------------------------------------------------------------------
-    if tool_count > 0 and metrics.stop_reason not in (StopReason.TOOL_USE, None):
+    if content_was_truncated:
+        # Truncation outranks everything: reporting end_turn on a cut-off
+        # response tells the client the model chose to stop, which is the
+        # single most misleading thing this door could say.
+        anthropic_stop = "max_tokens"
+    elif tool_count > 0 and metrics.stop_reason not in (StopReason.TOOL_USE, None):
         # Tool was emitted — override to tool_use unless metrics disagree
         anthropic_stop = "tool_use"
     elif metrics.stop_reason is not None:
